@@ -41,6 +41,7 @@ class MigrationTests(unittest.TestCase):
         self.mode = "success"
         self.calls = []
         self.durable_requests = []
+        self.seed_requests = 0
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -60,12 +61,24 @@ class MigrationTests(unittest.TestCase):
                     self.reply({}, 500 if fixture.locked else 200)
                 elif self.path == "/v1/state":
                     self.reply({"state": "LOCKED" if fixture.locked else "RPC_ACTIVE"})
+                elif self.path == "/v1/genseed":
+                    fixture.seed_requests += 1
+                    self.reply({"cipher_seed_mnemonic": ["test"] * 24})
                 else:
                     self.reply({"code": 5}, 404)
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fixture.calls.append((self.path, body))
+                if self.path.endswith("initwallet"):
+                    saved = fixture.read_unlock()
+                    fixture.durable_requests.append(
+                        base64.b64decode(body["wallet_password"]).decode() == saved["wallet_password"]
+                        and body["cipher_seed_mnemonic"] == saved["cipher_seed_mnemonic"])
+                    fixture.password = saved["wallet_password"]
+                    fixture.locked = False
+                    self.reply({})
+                    return
                 if not fixture.locked:
                     self.reply({"code": 2, "message": "wallet already unlocked"}, 500)
                     return
@@ -73,7 +86,10 @@ class MigrationTests(unittest.TestCase):
                 field = "current_password" if self.path.endswith("changepassword") else "wallet_password"
                 supplied = base64.b64decode(body[field]).decode()
                 if supplied != fixture.password:
-                    self.reply({"code": 2, "message": "invalid passphrase for master public key"}, 500)
+                    message = "invalid passphrase for master public key"
+                    if fixture.mode == "wrapped":
+                        message = "unable to open wallet: " + message
+                    self.reply({"code": 2, "message": message}, 500)
                     return
 
                 if self.path.endswith("unlockwallet"):
@@ -309,6 +325,79 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.password, pending)
         self.assert_completed()
+
+    def test_wrapped_wrong_password_still_tries_newline(self):
+        self.mode = "wrapped"
+        self.password += "\n"
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_completed()
+
+    def test_invalid_json_is_preserved_without_rpc(self):
+        for content in ("", "{", "{}\n{}", "[]", "null"):
+            with self.subTest(content=content):
+                self.unlock.write_text(content)
+                result = self.run_helper()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.unlock.read_text(), content)
+                self.assertIn("manual unlock", result.stdout)
+
+    def test_empty_generated_json_is_never_committed(self):
+        injection = self.data / "empty-output.sh"
+        injection.write_text('jq() { if [[ "$1" == -nc ]]; then return 0; fi; command jq "$@"; }\n')
+        result = self.run_helper({"BASH_ENV": injection.as_posix()})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.history.exists())
+        self.assertEqual(self.read_unlock(), self.original)
+        self.assertEqual(self.calls, [])
+
+    def test_repair_unlocks_saved_candidate_and_keeps_migration_pending(self):
+        for actual in ("hellorockstar", "hellorockstar\n", "already-saved-private-password"):
+            with self.subTest(actual=actual):
+                pending = "already-saved-private-password"
+                self.write_unlock(self.original | {"wallet_password_pending": pending})
+                self.password, self.locked = actual, True
+                self.calls = []
+                result = self.run_helper({"LND_PASSWORD_REPAIR_AUTH": "true"})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.locked)
+                self.assertEqual(self.read_unlock()["wallet_password"], actual)
+                self.assertEqual(self.read_unlock()["wallet_password_pending"], pending)
+                self.assertTrue(all(path.endswith("unlockwallet") for path, _ in self.calls))
+                self.assertIn("Restart the LND container once", result.stdout)
+                self.locked = True
+                result = self.run_helper()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.password, pending)
+                self.assertNotIn("wallet_password_pending", self.read_unlock())
+
+    def test_initialization_is_saved_before_rpc_and_reused(self):
+        (self.unlock.parent / "wallet.db").unlink()
+        self.unlock.unlink()
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = self.read_unlock()
+        self.assertEqual(self.unlock.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(saved["wallet_password"]), 44)
+        self.assertEqual(self.seed_requests, 1)
+        self.assertEqual(self.durable_requests, [True])
+        self.locked = True
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.read_unlock(), saved)
+        self.assertEqual(self.seed_requests, 1)
+        self.assertEqual(self.durable_requests, [True, True])
+
+    def test_initialization_write_failure_never_calls_initwallet(self):
+        (self.unlock.parent / "wallet.db").unlink()
+        self.unlock.unlink()
+        injection = self.data / "fail-write.sh"
+        injection.write_text("mktemp() { return 1; }\n")
+        result = self.run_helper({"BASH_ENV": injection.as_posix()})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.unlock.exists())
+        self.assertEqual(self.calls, [])
 
     def test_prepare_preserves_auth_files_and_never_moves_wallet_data(self):
         saved = self.original | {"wallet_password_pending": "uncertain-saved-password"}
