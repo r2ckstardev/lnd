@@ -1,6 +1,5 @@
 #!/bin/bash
 set -e
-. "$(dirname "$0")/docker-password-migration.sh"
 
 if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
 	mkdir -p "$LND_DATA"
@@ -93,8 +92,6 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         echo "noseedbackup=1" >> "$LND_DATA/lnd.conf"
     fi
 
-    prepare_password_migration "$LND_DATA" "$LND_DATA/data/chain/$NETWORK/$ENV"
-
     # One-time macaroon rotation, for revoking macaroons that leaked. Deleting
     # the macaroon files is not enough on its own: lnd re-bakes equivalent
     # tokens from the same root key, so macaroons.db has to go too. lnd then
@@ -103,20 +100,25 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
     # baked ones included, so all of them are cleared rather than left behind
     # as tokens that no longer work. Runs before lnd starts, so nothing is
     # holding the files open. Bump LND_MACAROON_ROTATION_ID to rotate again.
-    if [[ "${LND_MACAROON_ROTATION_ID}" ]]; then
+    # An interrupted password change can leave wallet.db and macaroons.db
+    # encrypted with different passwords. Recreate only authentication data;
+    # the unlocker will try the saved pending password before the old one.
+    PENDING_PASSWORD=false
+    if [[ -f "$LNDUNLOCK_FILE" ]]; then
+        PENDING_PASSWORD=$(jq -r 'has("wallet_password_pending")' "$LNDUNLOCK_FILE")
+        if [[ "$PENDING_PASSWORD" == true ]]; then
+            jq -e '.wallet_password_pending | type == "string" and length >= 8' "$LNDUNLOCK_FILE" >/dev/null
+        fi
+    fi
+    if [[ "${LND_MACAROON_ROTATION_ID}" || "$PENDING_PASSWORD" == true ]]; then
         ROTATION_MARKER="$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
-        if [ ! -f "$ROTATION_MARKER" ]; then
-            if [[ "$LND_DEFER_MACAROON_ROTATION" == "1" ]]; then
-                echo "[lnd_unlock_entrypoint] Macaroon rotation will run after the wallet password migration"
-            else
+        if [[ ! -f "$ROTATION_MARKER" || "$PENDING_PASSWORD" == true ]]; then
             echo "[lnd_unlock_entrypoint] Rotating macaroons ($LND_MACAROON_ROTATION_ID), ALL existing macaroons are being invalidated"
             # -exec rm rather than -delete, busybox find on alpine may not have it
-            find "$LND_DATA" -path "$LND_DATA/.password-migration-backups" -prune -o \
-                -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) \
+            find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) \
                 -print -exec rm -f {} \;
-            touch "$ROTATION_MARKER"
+            if [[ "${LND_MACAROON_ROTATION_ID}" ]]; then touch "$ROTATION_MARKER"; fi
             echo "[lnd_unlock_entrypoint] Macaroons removed, lnd will regenerate them. Every client must be re-paired"
-            fi
         fi
     fi
 
