@@ -30,7 +30,7 @@ def docker(*args, input=None, check=True):
     )
     if check and result.returncode:
         raise RuntimeError(f"docker {args[0]} failed: {result.stderr.decode()}")
-    return result.stdout
+    return result.stdout + result.stderr if args[0] == "logs" else result.stdout
 
 
 def wait_for(action, timeout=90):
@@ -85,6 +85,9 @@ class DockerMigrationTests(unittest.TestCase):
             "exec", cls.bitcoin, "bitcoin-cli", "-regtest", "-rpcuser=test",
             "-rpcpassword=test", "getblockchaininfo",
         ))
+        docker("exec", cls.bitcoin, "bitcoin-cli", "-regtest", "-rpcuser=test", "-rpcpassword=test", "createwallet", "test")
+        address = docker("exec", cls.bitcoin, "bitcoin-cli", "-regtest", "-rpcuser=test", "-rpcpassword=test", "getnewaddress").decode().strip()
+        docker("exec", cls.bitcoin, "bitcoin-cli", "-regtest", "-rpcuser=test", "-rpcpassword=test", "generatetoaddress", "101", address)
 
     def setUp(self):
         self.name = self.prefix + "-" + uuid.uuid4().hex[:8]
@@ -117,9 +120,22 @@ class DockerMigrationTests(unittest.TestCase):
             ]
         else:
             args += ["--entrypoint", "lnd", LND_IMAGE, "--lnddir=/data"]
-            args += ["--" + setting for setting in self.config.splitlines()]
+            for setting in self.config.splitlines():
+                key, value = setting.split("=", 1)
+                if key in ("bitcoin.active", "bitcoin.regtest", "no-rest-tls", "noseedbackup"):
+                    if value == "1":
+                        args.append("--" + key)
+                else:
+                    args.append("--" + setting)
         docker(*args)
-        port = json.loads(docker("inspect", self.name))[0]["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"]
+        def port_mapping():
+            state = json.loads(docker("inspect", self.name))[0]
+            if state["State"]["Status"] == "exited":
+                raise AssertionError(docker("logs", self.name, check=False).decode())
+            mapping = state["NetworkSettings"]["Ports"].get("8080/tcp")
+            return mapping[0]["HostPort"] if mapping else None
+
+        port = wait_for(port_mapping)
         self.url = "http://127.0.0.1:" + port
 
     def request(self, endpoint, payload=None, authenticated=False):
