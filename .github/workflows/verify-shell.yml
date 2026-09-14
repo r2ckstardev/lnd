@@ -7,7 +7,17 @@ permissions:
 jobs:
   startup:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: passwords
+            scenarios: legacy newline stored-newline empty null omitted custom custom-newline custom-stored-newline
+          - group: recovery
+            scenarios: pending-before pending-after missing-store-old missing-store-new missing-readonly split-store unknown invalid-json fresh interrupted-init
+          - group: channel
+            scenarios: password-only
     steps:
       - uses: actions/checkout@v5
       - name: Shell syntax
@@ -16,8 +26,11 @@ jobs:
           bash -n docker-initunlocklnd.sh
           bash -n tests/docker-startup.sh
       - name: Supplementary failure injection (outside the PR)
+        if: matrix.group == 'passwords'
         run: python3 .verification/test_shell_startup.py
       - name: Released LND integration
+        env:
+          TEST_SCENARIOS: ${{ matrix.scenarios }}
         run: bash tests/docker-startup.sh
   architecture-smoke:
     runs-on: ubuntu-latest

@@ -63,6 +63,7 @@ chmod +x "$WORK/count-lnd"
 docker network create --internal "$NAME" >/dev/null
 docker run -d --name "$BTC" --network "$NAME" --network-alias bitcoin \
     --entrypoint bitcoind btcpayserver/bitcoin:31.1 -regtest -server \
+    -fallbackfee=0.0002 \
     -rpcuser=test -rpcpassword=test -rpcbind=0.0.0.0:18443 -rpcallowip=0.0.0.0/0 \
     -listen=0 -zmqpubrawblock=tcp://0.0.0.0:28332 -zmqpubrawtx=tcp://0.0.0.0:28333 >/dev/null
 wait_for bitcoin getblockchaininfo
@@ -113,6 +114,7 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
         OLD_MACAROON=$(docker exec "$LND" xxd -p -c 10000 /data/admin.macaroon)
         if [[ "$SCENARIO" == password-only ]]; then
             # Verify a funded channel and its backup, not only an empty wallet.
+            echo "Creating disposable channel peer"
             printf '%s\n' "${CONFIG/restlisten=lnd/restlisten=0.0.0.0}" > "$WORK/peer.conf"
             docker create --name "$PEER" --network "$NAME" --network-alias peer \
                 --entrypoint /bin/lnd "$IMAGE" --lnddir=/data >/dev/null
@@ -123,14 +125,17 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
             curl -sf "$PEER_URL/v1/genseed" | jq -c '{wallet_password:("disposable-peer-password" | @base64),cipher_seed_mnemonic}' |
                 curl -sf --data-binary @- "$PEER_URL/v1/initwallet" >/dev/null
             wait_for peer_info
+            echo "Funding disposable channel wallet"
             bitcoin sendtoaddress "$(auth newaddress | jq -r .address)" 1 >/dev/null
             bitcoin generatetoaddress 6 "$(bitcoin getnewaddress)" >/dev/null
             wait_for funded
             PEER_KEY=$(peer_info | jq -r .identity_pubkey)
+            echo "Connecting disposable channel peer"
             jq -nc --arg key "$PEER_KEY" '{addr:{pubkey:$key,host:"peer:9735"},perm:true}' |
-                curl -sf -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/peers" >/dev/null
+                curl -sf --max-time 60 -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/peers" >/dev/null
             jq -nc --arg key "$PEER_KEY" '{node_pubkey_string:$key,local_funding_amount:"1000000",private:true}' |
-                curl -sf -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/channels" >/dev/null
+                curl -sf --max-time 60 -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/channels" >/dev/null
+            echo "Confirming disposable channel"
             bitcoin generatetoaddress 6 "$(bitcoin getnewaddress)" >/dev/null
             wait_for channel_open
             CHANNELS=$(channels)
