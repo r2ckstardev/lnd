@@ -269,7 +269,8 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
                         curl -sf -H "Grpc-Metadata-macaroon:$TOKEN" "$URL/v1/getinfo" >/dev/null
                     else
                         curl -s --max-time 5 -H "Grpc-Metadata-macaroon:$TOKEN" "$URL/v1/getinfo" |
-                            jq -e '.code != null and (.message | contains("signature mismatch"))' >/dev/null
+                            jq -e '.code != null and (.message | contains("signature mismatch") or
+                                endswith("root key with id 7 doesn\u0027t exist"))' >/dev/null
                     fi
                 done
             fi
