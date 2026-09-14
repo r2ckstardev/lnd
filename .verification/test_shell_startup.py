@@ -320,6 +320,7 @@ exec /usr/bin/mv "$@"''')
         self.assertEqual(json.loads(self.unlock.read_text()), first)
         self.assertEqual(self.seed_requests, 1)
         self.assertEqual(sum(path.endswith("initwallet") for path, _ in self.calls), 1)
+        self.assertEqual(self.rotations, 1)
 
     def test_saved_initialization_request_reused(self):
         self.fresh()

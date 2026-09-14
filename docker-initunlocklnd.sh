@@ -240,13 +240,17 @@ else
             {version:1,old_passwords:[$old,($old + "\n")],
             password:(.wallet_password_pending // $old),
             pending:has("wallet_password_pending"),migrate:has("wallet_password_pending"),initializing:false,rotation_id:""}' <<< "$METADATA")
-        if jq -e '.pending == false and (.password == "hellorockstar" or .password == "hellorockstar\n")' >/dev/null <<< "$RECORD"; then
-            NEW_PASSWORD=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-            [[ ${#NEW_PASSWORD} == 44 ]] || fail "Could not generate a replacement password."
-            RECORD=$(NEW_PASSWORD=$NEW_PASSWORD jq -c '.password=env.NEW_PASSWORD | .pending=true | .migrate=true' <<< "$RECORD")
-        fi
-        save_record
     fi
+    # InitWallet may have succeeded even when its response was lost. Once a
+    # wallet exists, use the ordinary existing-wallet path, including rotation.
+    RECORD=$(jq -c '.initializing=false |
+        if (.old_passwords | length) == 0 then .old_passwords=[.password] else . end' <<< "$RECORD")
+    if jq -e '.pending == false and (.password == "hellorockstar" or .password == "hellorockstar\n")' >/dev/null <<< "$RECORD"; then
+        NEW_PASSWORD=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+        [[ ${#NEW_PASSWORD} == 44 ]] || fail "Could not generate a replacement password."
+        RECORD=$(NEW_PASSWORD=$NEW_PASSWORD jq -c '.password=env.NEW_PASSWORD | .pending=true | .migrate=true' <<< "$RECORD")
+    fi
+    save_record
     # Preserve the attempt's original credentials, even after metadata rewrites.
     CANDIDATES=$(jq -cr '[.password] + .old_passwords | unique[] | @base64' <<< "$RECORD")
     FIRST=$(jq -r '.password | @base64' <<< "$RECORD")
@@ -256,8 +260,7 @@ else
     while IFS= read -r CURRENT_PASSWORD; do
         ENDPOINT=unlockwallet
         FINAL_PASSWORD=$CURRENT_PASSWORD
-        if [[ "$MIGRATE" == true || "$ROTATE" == true ]] &&
-            ! jq -e '.initializing' >/dev/null <<< "$RECORD"; then
+        if [[ "$MIGRATE" == true || "$ROTATE" == true ]]; then
             # Rotation alone changes the password to itself, preserving custom
             # passwords and their exact newline bytes.
             ENDPOINT=changepassword
