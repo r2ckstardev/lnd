@@ -100,7 +100,7 @@ class DockerMigrationTests(unittest.TestCase):
             "bitcoin.active=1", "bitcoin.regtest=1", "bitcoin.node=bitcoind",
             "bitcoind.rpchost=bitcoin:18443", "bitcoind.rpcuser=test", "bitcoind.rpcpass=test",
             "bitcoind.zmqpubrawblock=tcp://bitcoin:28332", "bitcoind.zmqpubrawtx=tcp://bitcoin:28333",
-            "restlisten=0.0.0.0:8080", "rpclisten=127.0.0.1:10009", "no-rest-tls=1",
+            "restlisten=lnd:8080", "rpclisten=127.0.0.1:10009", "no-rest-tls=1",
             "adminmacaroonpath=/data/admin.macaroon", "readonlymacaroonpath=/data/readonly.macaroon",
             "invoicemacaroonpath=/data/invoice.macaroon", "noseedbackup=0",
         ))
@@ -108,13 +108,14 @@ class DockerMigrationTests(unittest.TestCase):
     def start(self, overlay):
         args = [
             "run", "-d", "--name", self.name, "--network", self.network,
+            "--network-alias", "lnd",
             "-v", self.volume + ":/data", "-p", "127.0.0.1::8080",
         ]
         if overlay:
             args += [
                 "--restart", "unless-stopped", "-e", "LND_CHAIN=btc",
                 "-e", "LND_ENVIRONMENT=regtest", "-e", "LND_EXTRA_ARGS=" + self.config,
-                "-e", "LND_REST_LISTEN_HOST=http://127.0.0.1:8080",
+                "-e", "LND_REST_LISTEN_HOST=http://lnd:8080",
                 "-e", "LND_MACAROON_ROTATION_ID=integration-test",
                 self.image,
             ]

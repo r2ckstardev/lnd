@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# BTCPay's startup coordination only. LND and its databases are unchanged.
+# BTCPay's startup coordination around the unmodified LND binary.
 prepare_password_migration() {
     local data="$1" wallet_dir="$2" unlock old pending backup file relative
     unlock="$wallet_dir/walletunlock.json"
