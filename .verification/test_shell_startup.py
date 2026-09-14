@@ -39,7 +39,7 @@ class StartupTests(unittest.TestCase):
         self.durable = []
         self.bin = self.data / "bin"
         self.bin.mkdir()
-        self.env = dict(os.environ, LND_DATA=str(self.data), LND_MACAROON_ROTATION_ID="test", PATH=str(self.bin) + ":" + os.environ["PATH"])
+        self.env = dict(os.environ, LND_DATA=str(self.data), LND_MACAROON_ROTATION_ID="", PATH=str(self.bin) + ":" + os.environ["PATH"])
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,7 +57,7 @@ class StartupTests(unittest.TestCase):
                 if self.path.endswith("state"):
                     self.reply({"state": "NON_EXISTING" if not fixture.wallet.exists() else "LOCKED" if fixture.locked else "RPC_ACTIVE"})
                 elif self.path.endswith("getinfo"):
-                    self.reply({"identity_pubkey": "fixture"}, 500 if fixture.locked else 200)
+                    self.reply({"identity_pubkey": "fixture"}, 500 if fixture.locked or fixture.mode == "getinfo-error" else 200)
                 elif self.path.endswith("genseed"):
                     fixture.seed_requests += 1
                     self.reply({"cipher_seed_mnemonic": [None] if fixture.mode == "invalid-seed" else ["abandon"] * 24})
@@ -102,7 +102,14 @@ class StartupTests(unittest.TestCase):
                         return
                     fixture.store_password = new
                     if request.get("new_macaroon_root_key"):
-                        fixture.rotations += 1
+                        raise AssertionError("Password migration must not request rotation")
+                elif not (fixture.wallet_dir / "macaroons.db").exists():
+                    fixture.durable.append(fixture.read_record()["reset_pending"])
+                    fixture.store_password = supplied
+                    (fixture.wallet_dir / "macaroons.db").write_bytes(b"regenerated store")
+                    for name in ("admin", "readonly", "invoice"):
+                        (fixture.wallet_dir / (name + ".macaroon")).write_bytes(b"regenerated token")
+                    fixture.rotations += 1
                 if fixture.mode == "rewrite":
                     fixture.write_metadata({"wallet_password": "hellorockstar", "cipher_seed_mnemonic": ["Seed removed"], "concurrent": True})
                 fixture.locked = False
@@ -127,7 +134,10 @@ class StartupTests(unittest.TestCase):
         return json.loads(self.recovery.read_text())
 
     def run_script(self, ok=True, prepare=False):
-        result = subprocess.run(["bash", str(SCRIPT), "bitcoin", "regtest"] + (["--prepare", "lnd"] if prepare else []), env=self.env, capture_output=True, text=True, timeout=20)
+        command = ["bash", str(SCRIPT), "bitcoin", "regtest"]
+        result = subprocess.run(command + ["--prepare", "lnd"], env=self.env, capture_output=True, text=True, timeout=20)
+        if not prepare and result.returncode == 0:
+            result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr)
         else:
@@ -139,7 +149,7 @@ class StartupTests(unittest.TestCase):
         path.write_text("#!/bin/bash\n" + body + "\n")
         path.chmod(0o755)
 
-    def test_migrate_rotate_durable_and_steady(self):
+    def test_migrate_durable_and_steady(self):
         self.run_script()
         first = self.read_record()
         self.assertTrue(all(self.durable))
@@ -147,10 +157,10 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(len(base64.b64decode(first["password"])), 32)
         self.assertNotIn("cipher_seed_mnemonic", first)
         self.assertEqual(first["old_passwords"], ["hellorockstar", "hellorockstar\n"])
-        self.assertEqual(self.rotations, 1)
+        self.assertEqual(self.rotations, 0)
         self.locked = True
         self.run_script()
-        self.assertEqual(self.rotations, 1)
+        self.assertEqual(self.rotations, 0)
         self.assertEqual(self.read_record(), first)
 
     def test_omitted_default_newline(self):
@@ -168,6 +178,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.read_record()["password"], "custom password\n")
 
     def test_custom_newline_rotation(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
         self.password = self.store_password = "custom password\n"
         self.write_metadata({"wallet_password": "custom password"})
         self.run_script()
@@ -175,6 +186,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.rotations, 1)
 
     def recovery_only(self, pending):
+        self.env["LND_MACAROON_ROTATION_ID"] = "" if pending else "test"
         original = "hellorockstar" if pending else "custom password\n"
         target = "saved-before-request" if pending else original
         self.password = self.store_password = original
@@ -188,13 +200,13 @@ class StartupTests(unittest.TestCase):
         self.assertTrue(self.durable and all(self.durable))
         self.assertFalse(self.read_record()["pending"])
         self.assertEqual(self.read_record()["old_passwords"], [original])
-        self.assertEqual(self.read_record()["rotation_id"], "test")
+        self.assertEqual(self.read_record()["rotation_id"], "" if pending else "test")
         self.assertFalse(self.unlock.exists())
         self.assertEqual(self.recovery.stat().st_mode & 0o777, 0o600)
         completed = self.read_record()
         self.locked = True
         self.run_script()
-        self.assertEqual(self.rotations, 1)
+        self.assertEqual(self.rotations, 0 if pending else 1)
         self.assertEqual(self.read_record(), completed)
         self.assertFalse(self.unlock.exists())
 
@@ -254,9 +266,11 @@ class StartupTests(unittest.TestCase):
         self.locked = True
         self.run_script()
         self.assertEqual(self.read_record(), before)
-        self.assertEqual(self.rotations, 1)
+        self.assertEqual(self.rotations, 0)
 
     def test_invalid_metadata_preflight(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
+        store = (self.wallet_dir / "macaroons.db").read_bytes()
         for invalid in ("", "{", "[]", "{} {}", '{"wallet_password":7}', '{"wallet_password_pending":null}', '{"wallet_password_pending":"hellorockstar"}'):
             with self.subTest(invalid=invalid):
                 self.unlock.write_text(invalid)
@@ -264,16 +278,21 @@ class StartupTests(unittest.TestCase):
                 self.assertIn("Invalid metadata", output)
                 self.assertEqual(self.unlock.read_text(), invalid)
         self.assertFalse(self.calls)
+        self.assertEqual((self.wallet_dir / "macaroons.db").read_bytes(), store)
 
-    def test_missing_store_is_preflight_failure(self):
+    def test_missing_store_only_unlocks(self):
         (self.wallet_dir / "macaroons.db").unlink()
-        self.assertIn("Authentication preparation", self.run_script(False, True))
-        self.assertFalse(self.calls)
+        self.run_script()
+        self.assertEqual(self.password, "hellorockstar")
+        self.assertEqual(self.rotations, 1)
+        self.assertTrue(all(path.endswith("unlockwallet") for path, _ in self.calls))
 
-    def test_missing_token_is_preflight_failure(self):
+    def test_rotation_allows_missing_token(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
         (self.wallet_dir / "readonly.macaroon").unlink()
-        self.assertIn("required token file", self.run_script(False, True))
-        self.assertFalse(self.calls)
+        self.run_script()
+        self.assertEqual(self.password, "hellorockstar")
+        self.assertTrue((self.wallet_dir / "readonly.macaroon").exists())
 
     def test_missing_wallet_with_node_evidence(self):
         self.wallet.unlink()
@@ -308,6 +327,9 @@ class StartupTests(unittest.TestCase):
         self.assertTrue(self.read_record()["pending"])
 
     def test_promotion_failure_does_not_repeat_rotation(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
+        self.password = self.store_password = "custom password"
+        self.write_metadata({"wallet_password": self.password})
         self.wrapper("mv", '''if [[ "${@: -1}" == *walletunlock.json ]] && ! /usr/bin/jq -e 'has("wallet_password_pending")' "${@: -2:1}" >/dev/null; then exit 1; fi
 exec /usr/bin/mv "$@"''')
         self.run_script(False)
@@ -351,7 +373,7 @@ exec /usr/bin/mv "$@"''')
         self.assertEqual(json.loads(self.unlock.read_text()), first)
         self.assertEqual(self.seed_requests, 1)
         self.assertEqual(sum(path.endswith("initwallet") for path, _ in self.calls), 1)
-        self.assertEqual(self.rotations, 1)
+        self.assertEqual(self.rotations, 0)
 
     def test_saved_initialization_request_reused(self):
         self.fresh()
@@ -370,6 +392,7 @@ exec /usr/bin/mv "$@"''')
         self.assertFalse(self.calls)
 
     def test_custom_newline_rotation_retry_keeps_exact_password(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
         self.password = self.store_password = "custom password\n"
         self.write_metadata({"wallet_password": "custom password"})
         self.mode = "lost-response"
@@ -388,10 +411,10 @@ echo $((count+1)) > "$count_file"
 exec /usr/bin/sync''')
         self.run_script(False)
         self.assertFalse(self.calls)
-        self.assertTrue(self.read_record()["pending"])
+        self.assertEqual(self.read_record()["password"], "hellorockstar")
 
     def test_completed_record_failure_preserves_recovery(self):
-        self.wrapper("mv", '''if [[ "${@: -1}" == *.recovery ]] && /usr/bin/jq -e '.pending == false' "${@: -2:1}" >/dev/null; then exit 1; fi
+        self.wrapper("mv", '''if [[ "${@: -1}" == *.recovery ]] && /usr/bin/jq -e '.pending == false and .password != "hellorockstar"' "${@: -2:1}" >/dev/null; then exit 1; fi
 exec /usr/bin/mv "$@"''')
         self.run_script(False)
         self.assertTrue(self.read_record()["pending"])
@@ -400,6 +423,74 @@ exec /usr/bin/mv "$@"''')
         (self.bin / "mv").unlink()
         self.locked = True
         self.run_script()
+        self.assertEqual(self.rotations, 0)
+
+    def test_rotation_then_later_password_migration(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
+        self.run_script()
+        self.assertEqual(self.password, "hellorockstar")
+        self.assertEqual(self.rotations, 1)
+        self.assertTrue(all(path.endswith("unlockwallet") for path, _ in self.calls))
+        self.assertFalse(self.read_record()["reset_pending"])
+        self.calls.clear()
+        self.locked = True
+        self.run_script()
+        self.assertNotEqual(self.password, "hellorockstar")
+        self.assertEqual(self.rotations, 1)
+        self.assertTrue(all(path.endswith("changepassword") for path, _ in self.calls))
+
+    def test_rotation_retains_unapplied_pending_password(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
+        self.write_metadata({"wallet_password": "hellorockstar", "wallet_password_pending": "saved-before-request"})
+        self.run_script()
+        self.assertEqual(self.password, "hellorockstar")
+        self.assertEqual(self.read_record()["password"], "saved-before-request")
+        self.assertTrue(self.read_record()["pending"])
+        self.locked = True
+        self.run_script()
+        self.assertEqual(self.password, "saved-before-request")
+        self.assertFalse(self.read_record()["pending"])
+        self.assertEqual(self.rotations, 1)
+
+    def test_interrupted_reset_with_nonempty_store(self):
+        self.recovery.write_text(json.dumps({"version": 1, "password": self.password,
+            "old_passwords": [self.password], "pending": False, "migrate": False,
+            "initializing": False, "rotation_id": "", "reset_pending": True}))
+        self.run_script()
+        self.assertEqual(self.password, "hellorockstar")
+        self.assertEqual(self.rotations, 1)
+        self.assertTrue(all(path.endswith("unlockwallet") for path, _ in self.calls))
+
+    def test_failed_store_deletion_stops_before_requests(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
+        self.wrapper("rm", '[[ "${@: -1}" == */macaroons.db ]] && exit 1\nexec /usr/bin/rm "$@"')
+        self.assertIn("cleanup is incomplete", self.run_script(False))
+        self.assertFalse(self.calls)
+        self.assertTrue(self.read_record()["reset_pending"])
+        self.assertEqual(self.wallet.read_bytes(), b"wallet")
+        (self.bin / "rm").unlink()
+        self.run_script()
+        self.assertEqual(self.password, "hellorockstar")
+
+    def test_reset_not_completed_before_authenticated_startup(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
+        self.mode = "getinfo-error"
+        self.wrapper("sleep", "exit 0")
+        self.assertIn("authenticated startup did not finish", self.run_script(False))
+        self.assertTrue(self.read_record()["reset_pending"])
+        self.assertEqual(self.read_record()["rotation_id"], "")
+
+    def test_reset_completion_failure_repeats_only_reset(self):
+        self.env["LND_MACAROON_ROTATION_ID"] = "test"
+        self.wrapper("mv", '''if [[ "${@: -1}" == *.recovery ]] && /usr/bin/jq -e '.reset_pending == false' "${@: -2:1}" >/dev/null; then exit 1; fi
+exec /usr/bin/mv "$@"''')
+        self.run_script(False)
+        self.assertTrue(self.read_record()["reset_pending"])
+        self.assertEqual(self.password, "hellorockstar")
+        (self.bin / "mv").unlink()
+        self.locked = True
+        self.run_script()
+        self.assertEqual(self.password, "hellorockstar")
         self.assertEqual(self.rotations, 2)
 
 

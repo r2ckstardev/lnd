@@ -66,6 +66,7 @@ RECOVERY="$UNLOCK.recovery"
 CA_CERT="$LND_DATA/tls.cert"
 ROTATION=${LND_MACAROON_ROTATION_ID:-}
 ROTATE=false
+RESET=false
 RECORD='null'
 METADATA='{}'
 MACAROONS=("$WALLET_DIR/admin.macaroon" "$WALLET_DIR/readonly.macaroon" "$WALLET_DIR/invoice.macaroon")
@@ -123,8 +124,9 @@ if [[ -e "$RECOVERY" ]]; then
     jq -e '.version == 1 and (.password | type == "string" and length >= 8 and length <= 4096) and
         (.old_passwords | type == "array" and length <= 4 and all(.[]; type == "string" and length > 0 and length <= 4096)) and
         (.pending | type == "boolean") and (.migrate | type == "boolean") and (.initializing | type == "boolean") and
+        ((has("reset_pending") | not) or (.reset_pending | type == "boolean")) and
         (.rotation_id | type == "string") and
-        (keys - ["version","password","old_passwords","pending","migrate","initializing","rotation_id"] | length == 0) and
+        (keys - ["version","password","old_passwords","pending","migrate","initializing","rotation_id","reset_pending"] | length == 0) and
         (.initializing == false or (.pending == false and .migrate == false)) and
         (.pending == false or .migrate == false or (.password != "hellorockstar" and .password != "hellorockstar\n"))' >/dev/null <<< "$RECORD" ||
         fail "Invalid metadata at $RECOVERY: invalid recovery record."
@@ -149,14 +151,18 @@ fi
 if [[ -f "$WALLET" ]]; then
     [[ -f "$UNLOCK" || "$RECORD" != null ]] ||
         fail "Missing metadata at $UNLOCK; supply the existing wallet's credentials for manual recovery."
-    [[ -f "$WALLET_DIR/macaroons.db" && ! -L "$WALLET_DIR/macaroons.db" ]] ||
-        manual_auth "macaroons.db is missing or is not a regular file"
-    if [[ "$ROTATE" == true ]]; then
-        for macaroon in "${MACAROONS[@]}"; do
-            [[ -f "$macaroon" && ! -L "$macaroon" ]] ||
-                manual_auth "required token file is missing or is not a regular file: $macaroon"
-        done
+    [[ ! -L "$WALLET_DIR/macaroons.db" &&
+        ( ! -e "$WALLET_DIR/macaroons.db" || -f "$WALLET_DIR/macaroons.db" ) ]] ||
+        manual_auth "macaroons.db is not a regular file"
+    if [[ "$RECORD" == null ]]; then
+        RECORD=$(jq -c '
+            (.wallet_password // "" | if . == "" then "hellorockstar" else . end) as $old |
+            {version:1,old_passwords:[$old,($old + "\n")],
+            password:(.wallet_password_pending // $old),
+            pending:has("wallet_password_pending"),migrate:has("wallet_password_pending"),initializing:false,rotation_id:""}' <<< "$METADATA")
     fi
+    RECORD=$(jq -c '.initializing=false |
+        if (.old_passwords | length) == 0 then .old_passwords=[.password] else . end' <<< "$RECORD")
 else
     [[ ! -e "$WALLET" ]] || fail "Filesystem error: $WALLET is not a regular file."
     if [[ "$RECORD" != null ]]; then
@@ -183,7 +189,7 @@ else
     fi
 fi
 
-# Run synchronously before exec lnd. No database is opened, removed or changed.
+# Run synchronously before exec lnd. Never remove wallet or channel data.
 if [[ "${3:-}" == --prepare ]]; then
     if [[ ! -f "$WALLET" && "$RECORD" == null ]]; then
         mkdir -p "$WALLET_DIR"
@@ -197,10 +203,33 @@ if [[ "${3:-}" == --prepare ]]; then
         RECORD=$(INITIAL_PASSWORD=$INITIAL_PASSWORD jq -nc '{version:1,
             password:(env.INITIAL_PASSWORD | @base64d),old_passwords:[],
             pending:false,migrate:false,initializing:true,rotation_id:""}')
-        save_record
+    fi
+    # Save before cleanup so an interrupted reset remains an unlock-only start,
+    # even if LND has since created a nonempty but unfinished macaroon database.
+    if [[ "$ROTATE" == true ]] || jq -e '.reset_pending == true' >/dev/null <<< "$RECORD" ||
+        [[ -f "$WALLET" && ! -s "$WALLET_DIR/macaroons.db" ]]; then
+        RECORD=$(jq -c '.reset_pending=true' <<< "$RECORD")
+    fi
+    save_record
+    if [[ -f "$UNLOCK" ]]; then
+        chmod 600 "$UNLOCK" || fail "Filesystem error protecting credentials at $UNLOCK."
+    fi
+    if jq -e '.reset_pending == true' >/dev/null <<< "$RECORD"; then
+        log "Resetting macaroons before startup; the wallet password will not change on this start."
+        for macaroon in "${MACAROONS[@]}"; do
+            [[ ! -L "$macaroon" ]] || fail "Unsupported configuration: macaroon file is a symlink: $macaroon."
+            rm -f -- "$macaroon" || fail "Filesystem error removing $macaroon."
+        done
+        find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) -exec rm -f {} \; ||
+            fail "Filesystem error resetting macaroons."
+        remaining=$(find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) -print -quit) ||
+            fail "Filesystem error checking macaroon cleanup."
+        [[ -z "$remaining" ]] || fail "Filesystem error: macaroon cleanup is incomplete."
+        sync || fail "Filesystem error synchronizing macaroon cleanup."
     fi
     exit 0
 fi
+RESET=$(jq -r '.reset_pending // false' <<< "$RECORD")
 
 # Readiness does not prove password acceptance. Launching LND remains solely
 # the entrypoint's job; failed requests never launch or restart a daemon.
@@ -236,49 +265,37 @@ if [[ "$STATE" == NON_EXISTING ]]; then
     success "$RESPONSE" || fail "Initialization rejected; inspect LND's logs. Saved initialization data is retained."
     FINAL_PASSWORD=$(jq -r '.wallet_password | @base64' <<< "$METADATA")
 else
-    if [[ "$RECORD" == null ]]; then
-        RECORD=$(jq -c '
-            (.wallet_password // "" | if . == "" then "hellorockstar" else . end) as $old |
-            {version:1,old_passwords:[$old,($old + "\n")],
-            password:(.wallet_password_pending // $old),
-            pending:has("wallet_password_pending"),migrate:has("wallet_password_pending"),initializing:false,rotation_id:""}' <<< "$METADATA")
+    ENDPOINT=unlockwallet
+    # 1. A macaroon reset only unlocks; it never changes the wallet password.
+    if [[ "$RESET" == true ]]; then
+        log "Unlocking after macaroon reset; password migration is deferred to a later normal start."
+    # 2. Otherwise migrate a legacy password or finish a saved password change.
+    elif jq -e '(.pending and .migrate) or .password == "hellorockstar" or .password == "hellorockstar\n"' >/dev/null <<< "$RECORD"; then
+        ENDPOINT=changepassword
+        if ! jq -e '.pending and .migrate' >/dev/null <<< "$RECORD"; then
+            NEW_PASSWORD=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+            [[ ${#NEW_PASSWORD} == 44 ]] || fail "Could not generate a replacement password."
+            RECORD=$(NEW_PASSWORD=$NEW_PASSWORD jq -c '.password=env.NEW_PASSWORD | .pending=true | .migrate=true' <<< "$RECORD")
+        fi
+        save_record
+        if [[ -f "$UNLOCK" ]]; then
+            CURRENT_METADATA=$(read_json "$UNLOCK")
+            printf '%s\n%s\n' "$CURRENT_METADATA" "$RECORD" | jq -cs '.[0] + {wallet_password_pending:.[1].password}' |
+                save_json "$UNLOCK" || fail "Filesystem error saving pending state at $UNLOCK."
+        fi
     fi
-    # InitWallet may have succeeded even when its response was lost. Once a
-    # wallet exists, use the ordinary existing-wallet path, including rotation.
-    RECORD=$(jq -c '.initializing=false |
-        if (.old_passwords | length) == 0 then .old_passwords=[.password] else . end' <<< "$RECORD")
-    if jq -e '.pending == false and (.password == "hellorockstar" or .password == "hellorockstar\n")' >/dev/null <<< "$RECORD"; then
-        NEW_PASSWORD=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-        [[ ${#NEW_PASSWORD} == 44 ]] || fail "Could not generate a replacement password."
-        RECORD=$(NEW_PASSWORD=$NEW_PASSWORD jq -c '.password=env.NEW_PASSWORD | .pending=true | .migrate=true' <<< "$RECORD")
-    fi
-    save_record
+    # 3. All other wallets simply unlock with their saved custom password.
     # Preserve the attempt's original credentials, even after metadata rewrites.
     CANDIDATES=$(jq -cr '[.password] + .old_passwords | unique[] | @base64' <<< "$RECORD")
     FIRST=$(jq -r '.password | @base64' <<< "$RECORD")
     CANDIDATES=$(printf '%s\n%s\n' "$FIRST" "$CANDIDATES" | awk '!seen[$0]++')
-    MIGRATE=$(jq -r '.pending and .migrate' <<< "$RECORD")
     ACCEPTED=false
     while IFS= read -r CURRENT_PASSWORD; do
-        ENDPOINT=unlockwallet
         FINAL_PASSWORD=$CURRENT_PASSWORD
-        if [[ "$MIGRATE" == true || "$ROTATE" == true ]]; then
-            # Rotation alone changes the password to itself, preserving custom
-            # passwords and their exact newline bytes.
-            ENDPOINT=changepassword
-            if [[ "$MIGRATE" == true ]]; then FINAL_PASSWORD=$FIRST; fi
-            RECORD=$(FINAL_PASSWORD=$FINAL_PASSWORD jq -c '.password=(env.FINAL_PASSWORD | @base64d) | .pending=true' <<< "$RECORD")
-            save_record
-            if [[ -f "$UNLOCK" ]]; then
-                CURRENT_METADATA=$(read_json "$UNLOCK")
-                printf '%s\n%s\n' "$CURRENT_METADATA" "$RECORD" | jq -cs '.[0] + {wallet_password_pending:.[1].password}' |
-                    save_json "$UNLOCK" || fail "Filesystem error saving pending state at $UNLOCK."
-            fi
-        fi
-        REQUEST=$(CURRENT_PASSWORD=$CURRENT_PASSWORD FINAL_PASSWORD=$FINAL_PASSWORD ROTATE=$ROTATE ENDPOINT=$ENDPOINT jq -nc '
+        if [[ "$ENDPOINT" == changepassword ]]; then FINAL_PASSWORD=$FIRST; fi
+        REQUEST=$(CURRENT_PASSWORD=$CURRENT_PASSWORD FINAL_PASSWORD=$FINAL_PASSWORD ENDPOINT=$ENDPOINT jq -nc '
             if env.ENDPOINT == "changepassword" then
-                {current_password:env.CURRENT_PASSWORD,new_password:env.FINAL_PASSWORD,
-                 new_macaroon_root_key:(env.ROTATE == "true")}
+                {current_password:env.CURRENT_PASSWORD,new_password:env.FINAL_PASSWORD}
             else {wallet_password:env.CURRENT_PASSWORD} end')
         RESPONSE=$(post "$REQUEST" "$ENDPOINT") ||
             fail "Request outcome unknown; saved passwords retained at $RECOVERY. Inspect LND before manual recovery."
@@ -290,7 +307,7 @@ else
 fi
 
 # RPC success can precede token creation. Confirm authenticated startup before
-# recording completion; never require another daemon start to finish migration.
+# recording completion of this start's operation.
 for ((attempt=0; attempt<120; attempt++)); do
     if [[ -s "$MACAROON_FILE" ]]; then
         HEADER="Grpc-Metadata-macaroon:$(xxd -p -c 10000 "$MACAROON_FILE" | tr -d ' \n')"
@@ -306,19 +323,23 @@ sync "$WALLET" "$WALLET_DIR/macaroons.db" "${MACAROONS[@]}" ||
     fail "Filesystem error synchronizing wallet/authentication data; completion was not recorded."
 
 RECORD=$(FINAL_PASSWORD=$FINAL_PASSWORD ROTATION=$ROTATION jq -c '
-    .password=(env.FINAL_PASSWORD | @base64d) | .pending=false | .initializing=false |
+    (env.FINAL_PASSWORD | @base64d) as $final |
+    if .pending and .migrate and .password != $final then .
+    else .password=$final | .pending=false | .migrate=false end |
+    .initializing=false | .reset_pending=false |
     if env.ROTATION != "" then .rotation_id=env.ROTATION else . end' <<< "$RECORD")
 # Save independently before metadata promotion. Re-read to retain seed removal
 # and unrelated fields written by BTCPay while the RPC was in progress.
 save_record
 if [[ -f "$UNLOCK" ]]; then
     CURRENT_METADATA=$(read_json "$UNLOCK")
-    printf '%s\n%s\n' "$CURRENT_METADATA" "$RECORD" | jq -cs \
-        '.[0] + {wallet_password:.[1].password} | del(.wallet_password_pending)' |
+    printf '%s\n%s\n' "$CURRENT_METADATA" "$RECORD" | FINAL_PASSWORD=$FINAL_PASSWORD jq -cs '
+        .[1] as $record | .[0] + {wallet_password:(env.FINAL_PASSWORD | @base64d)} |
+        if $record.pending then .wallet_password_pending=$record.password else del(.wallet_password_pending) end' |
         save_json "$UNLOCK" || fail "Filesystem error updating $UNLOCK; verified credentials remain in $RECOVERY."
 fi
-log "Wallet ready; verified credentials saved at $RECOVERY."
-[[ "$ROTATE" != true ]] || log "Macaroon rotation complete. All previous root IDs are revoked; clients must obtain new macaroons."
+log "Wallet ready; recovery credentials saved at $RECOVERY."
+[[ "$RESET" != true ]] || log "Macaroon reset complete. All previous macaroons are revoked; clients must obtain new macaroons."
 
 if [[ -n "${LND_HOST_FOR_LOOP:-}" ]]; then
     if [[ "$2" == regtest || "$2" == signet ]]; then

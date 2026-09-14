@@ -84,8 +84,8 @@ if [[ "$1" == "lnd" ]]; then
         echo "externalip=$HIDDENSERVICE_ONION added to $LND_DATA/lnd.conf"
     fi
 
-    # Validate metadata and save new-installation state before the only daemon
-    # start. Password changes and native root-key rotation run through LND RPC.
+    # Save credentials and reset macaroons before the only daemon start.
+    # A reset startup only unlocks; password migration waits for a later start.
     ./docker-initunlocklnd.sh "$NETWORK" "$ENV" --prepare "$@"
     ./docker-initunlocklnd.sh "$NETWORK" "$ENV" &
     ln -sfn "$LND_DATA" /root/.lnd
