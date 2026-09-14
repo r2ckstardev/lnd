@@ -32,17 +32,31 @@ post() {
         -H 'Content-Type: application/json' --data-binary @- "$LND_REST_LISTEN_HOST/v1/$2"
 }
 success() {
-    jq -e 'type == "object" and (has("code") | not) and
-        (. == {} or (.admin_macaroon | type == "string"))' >/dev/null <<< "$1"
+    jq -es 'length == 1 and (.[0] | type == "object" and (has("code") | not) and
+        (. == {} or (.admin_macaroon | type == "string")))' >/dev/null <<< "$1"
 }
 wrong_password() {
     # This error comes from opening wallet public keys. Other errors do not
     # establish whether the password was accepted or whether it changed.
-    jq -e '(.code == 2) and ((.message // "") |
-        test("^(unable to open wallet: )?invalid passphrase for master public key$"))' >/dev/null <<< "$1"
+    jq -es 'length == 1 and (.[0] | (.code == 2) and ((.message // "") |
+        test("^(unable to open wallet: )?invalid passphrase for master public key$")))' >/dev/null <<< "$1"
 }
 manual_auth() {
     fail "Authentication preparation requires manual recovery: $*. Preserve the wallet, seed, channel backup and $RECOVERY. Inspect LND before any offline repair; do not delete a live database."
+}
+rpc_failed() {
+    local message
+    message=$(jq -r '.message // empty' <<< "$1" 2>/dev/null || true)
+    case "$message" in
+        *timeout*|*database\ is\ locked*)
+            fail "Database busy or request timed out. Inspect LND's logs; saved credentials are retained at $RECOVERY." ;;
+        *permission\ denied*|*read-only\ file\ system*|*no\ space\ left*)
+            fail "Filesystem error during the wallet request. Inspect LND's logs; saved credentials are retained at $RECOVERY." ;;
+        *macaroon*|*root\ key*|*could\ not\ create\ unlock*|*could\ not\ change\ password*)
+            manual_auth "LND rejected the request for a reason other than the recognized wrong-wallet-password error; the wallet password may already have changed" ;;
+        *)
+            fail "Unexpected LND response; password acceptance and migration completion are unconfirmed. Inspect LND's logs; saved credentials remain at $RECOVERY." ;;
+    esac
 }
 
 WALLET_DIR="$LND_DATA/data/chain/$1/$2"
@@ -112,7 +126,8 @@ if [[ -e "$RECOVERY" ]]; then
     # Older BTCPay may write stale password data when removing the seed.
     if ! printf '%s\n%s\n' "$METADATA" "$RECORD" | jq -es '
         .[0] as $m | .[1] as $r |
-        (($m.wallet_password_pending // $r.password) == $r.password) and
+        (($m.wallet_password_pending // $r.password) as $p | $p == $r.password or
+        ($r.migrate == false and ($r.old_passwords | index($p) != null))) and
         (($m.wallet_password // "") as $p | $p == "" or $p == $r.password or
         ($r.old_passwords | index($p) != null))' >/dev/null; then
         fail "Invalid metadata: conflicting credentials in $UNLOCK and $RECOVERY; both files were preserved."
@@ -253,8 +268,7 @@ else
         RESPONSE=$(post "$REQUEST" "$ENDPOINT") ||
             fail "Request outcome unknown; saved passwords retained at $RECOVERY. Inspect LND before manual recovery."
         if success "$RESPONSE"; then ACCEPTED=true; break; fi
-        wrong_password "$RESPONSE" ||
-            manual_auth "LND rejected $ENDPOINT for a reason other than the recognized wrong-wallet-password error; the wallet password may already have changed"
+        wrong_password "$RESPONSE" || rpc_failed "$RESPONSE"
     done <<< "$CANDIDATES"
     [[ "$ACCEPTED" == true ]] ||
         fail "Manual recovery required: none of the saved password candidates unlocked this wallet. Preserve your existing LND data, seed and channel backup. Recovery information: https://github.com/btcpayserver/btcpayserver-docker/issues/1112#issuecomment-5659154559"

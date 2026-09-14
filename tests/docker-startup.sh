@@ -178,7 +178,7 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
             if [[ "$SCENARIO" != fresh ]]; then
                 [[ $(auth getinfo | jq -r .identity_pubkey) == "$IDENTITY" ]]
                 saved | jq -e '.unrelated.keep' >/dev/null
-                [[ $(saved | jq -c .cipher_seed_mnemonic) == $(jq -c .cipher_seed_mnemonic <<< "$SEED") ]]
+                [[ $(saved | jq -c .cipher_seed_mnemonic) == "$(jq -c .cipher_seed_mnemonic <<< "$SEED")" ]]
                 if [[ "$SCENARIO" == custom* ]]; then
                     [[ "$FINAL" == $(printf %s "$ACTUAL" | base64 | tr -d '\n') ]]
                 fi
