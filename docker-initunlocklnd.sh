@@ -318,8 +318,8 @@ done
 [[ $attempt -lt 120 ]] ||
     fail "Wallet request accepted, but authenticated startup did not finish. Saved credentials are retained; inspect LND's logs."
 
-# Flush LND's resulting authentication files before our completion record.
-sync "$WALLET" "$WALLET_DIR/macaroons.db" "${MACAROONS[@]}" ||
+# Flush the resulting files and their new directory entries before completion.
+sync "$WALLET" "$WALLET_DIR/macaroons.db" "${MACAROONS[@]}" && sync ||
     fail "Filesystem error synchronizing wallet/authentication data; completion was not recorded."
 
 RECORD=$(FINAL_PASSWORD=$FINAL_PASSWORD ROTATION=$ROTATION jq -c '
