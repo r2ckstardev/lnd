@@ -1,5 +1,54 @@
 #!/bin/bash
 set -e
+umask 077
+. "$(dirname "$0")/docker-password-migration.sh"
+
+# Keep the previous password and a pending replacement in the same durable
+# document. ChangePassword can commit wallet.db and still return an error.
+# Never send a replacement to LND until it can be recovered from this file.
+save_unlock_file() {
+    local temporary
+    temporary=$(mktemp "$LNDUNLOCK_FILE.tmp.XXXXXX") || return 1
+    if ! jq -c "$@" "$LNDUNLOCK_FILE" > "$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    chmod 600 "$temporary" || return 1
+    sync || return 1
+    mv -f "$temporary" "$LNDUNLOCK_FILE" || return 1
+    sync || return 1
+}
+
+wallet_request() {
+    local endpoint="$1" payload="$2"
+    # A transport failure is an uncertain outcome, not proof of rollback.
+    curl -s --connect-timeout 10 --max-time 120 --cacert "$CA_CERT" \
+        -X POST -H "$MACAROON_HEADER" -d "$payload" \
+        "$LND_REST_LISTEN_HOST/v1/$endpoint"
+}
+
+request_succeeded() {
+    jq -e 'type == "object" and (length == 0 or
+        (has("admin_macaroon") and (.admin_macaroon | type == "string")))' \
+        >/dev/null 2>&1 <<< "$1"
+}
+
+wrong_wallet_password() {
+    # Only this pre-mutation wallet-open error justifies trying the legacy
+    # newline variant. Preserve all other errors instead of hiding them.
+    jq -e '.message == "invalid passphrase for master public key"' \
+        >/dev/null 2>&1 <<< "$1"
+}
+
+finish_password_migration() {
+    save_unlock_file '.wallet_password = .wallet_password_pending |
+        del(.wallet_password_pending)' || return 1
+    echo "[initunlocklnd] Migrated wallet off the default password; the new random password is in $LNDUNLOCK_FILE"
+    if [[ -n "${LND_MACAROON_ROTATION_ID:-}" && \
+        ! -f "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID" ]]; then
+        restart_after_password_migration
+    fi
+}
 
 echo "[initunlocklnd] Waiting 2 seconds for lnd..."
 sleep 2
@@ -64,48 +113,81 @@ if [ -f "$WALLET_FILE" ]; then
         # the older version.
         WALLETPASS_BASE64=$(echo $WALLETPASS | tr -d '\n\r' | base64)
 
-        # Wallets still on the legacy shared default password ("hellorockstar",
-        # or an empty file field falling back to it) are migrated to a random
-        # per-instance password. changepassword on a locked wallet changes +
-        # unlocks, and it only exists while locked, so migration must happen
-        # INSTEAD of a plain unlock, not after it. The file is only rewritten
-        # AFTER changepassword succeeds, so a failed migration never strands
-        # the wallet: next start just retries. The mnemonic (or the "Seed
-        # removed" placeholder) is preserved as-is.
+        # Resume a saved attempt before generating another password. A pending
+        # replacement may already be the wallet's password after an RPC error
+        # or an interruption before the final file update.
+        PENDING_EXISTS=$(jq -r 'has("wallet_password_pending")' "$LNDUNLOCK_FILE")
+        if [[ "$PENDING_EXISTS" == "true" ]]; then
+            if ! jq -e '.wallet_password_pending | type == "string" and length >= 8' \
+                "$LNDUNLOCK_FILE" >/dev/null; then
+                echo "[initunlocklnd] Invalid pending wallet password; preserving the unlock file for recovery"
+                exit 1
+            fi
+        fi
+
         MIGRATE_DEFAULT=0
-        if [[ "$WALLETPASS" == "hellorockstar" ]]; then
+        if [[ "$WALLETPASS" == "hellorockstar" || "$PENDING_EXISTS" == "true" ]]; then
             MIGRATE_DEFAULT=1
         fi
 
         if [[ $MIGRATE_DEFAULT == 1 ]]; then
-            NEWPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-            NEWPASS_BASE64=$(echo $NEWPASS | tr -d '\n\r' | base64)
-            # line feed hex code 0x0A: oldest installs have the default
-            # password including a trailing line feed, so if the corrected
-            # one fails we retry the rotation from that variant
-            WALLETPASS_BASE64_CURRENT=$(echo $WALLETPASS | base64)
+            if [[ "$PENDING_EXISTS" == "true" ]]; then
+                NEWPASS=$(jq -r '.wallet_password_pending' "$LNDUNLOCK_FILE")
+            else
+                NEWPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+                if [[ ${#NEWPASS} != 44 ]]; then
+                    echo "[initunlocklnd] Could not generate a wallet password; no password change was attempted"
+                    exit 1
+                fi
+                save_unlock_file --arg pw "$NEWPASS" '.wallet_password_pending = $pw'
+            fi
+            NEWPASS_BASE64=$(printf %s "$NEWPASS" | base64 | tr -d '\n')
 
-            # Note: a successful changepassword returns {} when macaroons are
-            # disabled, or {"admin_macaroon":"..."} when they are enabled
-            rotate_response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
-                -d '{ "current_password":"'$WALLETPASS_BASE64'", "new_password":"'$NEWPASS_BASE64'" }' \
-                $LND_REST_LISTEN_HOST/v1/changepassword)
-            if [[ "$rotate_response" != "{}" && "$rotate_response" != *'"admin_macaroon"'* ]]; then
-                rotate_response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
-                    -d '{ "current_password":"'$WALLETPASS_BASE64_CURRENT'", "new_password":"'$NEWPASS_BASE64'" }' \
-                    $LND_REST_LISTEN_HOST/v1/changepassword)
+            migrated=0
+            if [[ "$PENDING_EXISTS" == "true" ]]; then
+                if ! pending_response=$(wallet_request unlockwallet \
+                    "$(jq -cn --arg pw "$NEWPASS_BASE64" '{wallet_password: $pw}')"); then
+                    echo "[initunlocklnd] Pending-password unlock had an uncertain outcome; both passwords remain in $LNDUNLOCK_FILE"
+                    exit 1
+                fi
+                if request_succeeded "$pending_response"; then
+                    finish_password_migration
+                    migrated=1
+                elif ! wrong_wallet_password "$pending_response"; then
+                    echo "[initunlocklnd] Pending-password unlock failed: $pending_response"
+                    echo "[initunlocklnd] Both passwords remain in $LNDUNLOCK_FILE; migration is not complete"
+                    exit 1
+                fi
             fi
 
-            response=""
-            if [[ "$rotate_response" == "{}" || "$rotate_response" == *'"admin_macaroon"'* ]]; then
-                jq -c --arg pw "$NEWPASS" '.wallet_password = $pw' "$LNDUNLOCK_FILE" > "$LNDUNLOCK_FILE.tmp" \
-                    && mv "$LNDUNLOCK_FILE.tmp" "$LNDUNLOCK_FILE"
-                echo "[initunlocklnd] Migrated wallet off the default password; the new random password is in $LNDUNLOCK_FILE"
-                response="{}"
-            else
-                echo "[initunlocklnd] WARNING: migration off the default password failed, lnd returned: $rotate_response"
-                echo "[initunlocklnd] Wallet is still locked, migration will be retried on next start"
-                exit 1
+            if [[ "$migrated" == "0" ]]; then
+                if ! rotate_response=$(wallet_request changepassword \
+                    "$(jq -cn --arg old "$WALLETPASS_BASE64" --arg new "$NEWPASS_BASE64" \
+                        '{current_password: $old, new_password: $new}')"); then
+                    echo "[initunlocklnd] Password change had an uncertain outcome; both passwords remain in $LNDUNLOCK_FILE"
+                    exit 1
+                fi
+                if wrong_wallet_password "$rotate_response"; then
+                    WALLETPASS_BASE64_CURRENT=$(printf '%s\n' "$WALLETPASS" | base64 | tr -d '\n')
+                    if ! rotate_response=$(wallet_request changepassword \
+                        "$(jq -cn --arg old "$WALLETPASS_BASE64_CURRENT" --arg new "$NEWPASS_BASE64" \
+                            '{current_password: $old, new_password: $new}')"); then
+                        echo "[initunlocklnd] Legacy password change had an uncertain outcome; both passwords remain in $LNDUNLOCK_FILE"
+                        exit 1
+                    fi
+                fi
+
+                if request_succeeded "$rotate_response"; then
+                    finish_password_migration
+                else
+                    echo "[initunlocklnd] Password migration failed: $rotate_response"
+                    echo "[initunlocklnd] The wallet password may already have changed; both passwords remain in $LNDUNLOCK_FILE"
+                    if jq -e '.message == "default root key not found"' \
+                        >/dev/null 2>&1 <<< "$rotate_response"; then
+                        restart_after_password_migration
+                    fi
+                    exit 1
+                fi
             fi
         else
         response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
