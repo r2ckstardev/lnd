@@ -1,7 +1,7 @@
 #!/bin/bash
 # Disposable regtest integration tests using the released, unmodified LND binary.
 # Run: bash tests/docker-startup.sh (Docker, curl and jq required).
-set -euo pipefail
+set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 IMAGE=btcpayserver/lnd:v0.21.3-beta-1
 NAME=btcpay-startup-$$
@@ -17,6 +17,7 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
+trap 'echo "FAIL ${SCENARIO:-setup} at test line $LINENO" >&2; docker logs --tail 25 "$LND" >&2 || true' ERR
 wait_for() {
     for ((i=0; i<120; i++)); do
         if "$@" >/dev/null 2>&1; then return 0; fi

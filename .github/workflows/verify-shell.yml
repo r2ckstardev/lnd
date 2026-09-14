@@ -11,6 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Shell syntax
-        run: bash -n docker-entrypoint.sh docker-initunlocklnd.sh tests/docker-startup.sh
+        run: |
+          bash -n docker-entrypoint.sh
+          bash -n docker-initunlocklnd.sh
+          bash -n tests/docker-startup.sh
+      - name: Supplementary failure injection (outside the PR)
+        run: python3 .verification/test_shell_startup.py
       - name: Released LND integration
         run: bash tests/docker-startup.sh
