@@ -16,12 +16,12 @@ save_json() {
     temporary=$(mktemp "$file.tmp.XXXXXX") || return 1
     if ! cat > "$temporary" ||
         ! jq -es 'length == 1 and (.[0] | type == "object")' "$temporary" >/dev/null ||
-        ! chmod 600 "$temporary" || ! sync ||
+        ! chmod 600 "$temporary" || ! sync "$temporary" ||
         ! mv -f "$temporary" "$file"; then
         rm -f "$temporary"
         return 1
     fi
-    sync || return 1
+    sync "$(dirname "$file")" || return 1
 }
 save_record() {
     printf '%s\n' "$RECORD" | save_json "$RECOVERY" ||
@@ -284,7 +284,11 @@ for ((attempt=0; attempt<120; attempt++)); do
     sleep 2
 done
 [[ $attempt -lt 120 ]] ||
-    fail "Wallet request accepted, but authenticated startup did not finish. Saved credentials remain pending; inspect LND's logs."
+    fail "Wallet request accepted, but authenticated startup did not finish. Saved credentials are retained; inspect LND's logs."
+
+# Flush LND's resulting authentication files before our completion record.
+sync "$WALLET" "$WALLET_DIR/macaroons.db" "${MACAROONS[@]}" ||
+    fail "Filesystem error synchronizing wallet/authentication data; completion was not recorded."
 
 RECORD=$(FINAL_PASSWORD=$FINAL_PASSWORD ROTATION=$ROTATION jq -c '
     .password=(env.FINAL_PASSWORD | @base64d) | .pending=false | .initializing=false |

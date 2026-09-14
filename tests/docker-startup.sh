@@ -7,11 +7,12 @@ IMAGE=btcpayserver/lnd:v0.21.3-beta-1
 NAME=btcpay-startup-$$
 BTC=$NAME-bitcoin
 LND=$NAME-lnd
+PEER=$NAME-peer
 VOLUME=$NAME-data
 WALLET=/data/data/chain/bitcoin/regtest/walletunlock.json
 WORK=$(mktemp -d)
 cleanup() {
-    docker rm -fv "$LND" "$BTC" >/dev/null 2>&1 || true
+    docker rm -fv "$LND" "$PEER" "$BTC" >/dev/null 2>&1 || true
     docker volume rm "$VOLUME" >/dev/null 2>&1 || true
     docker network rm "$NAME" >/dev/null 2>&1 || true
     rm -rf "$WORK"
@@ -31,6 +32,12 @@ bitcoin() { docker exec "$BTC" bitcoin-cli -regtest -rpcuser=test -rpcpassword=t
 address() { docker inspect "$LND" | jq -r --arg n "$NAME" '.[0].NetworkSettings.Networks[$n].IPAddress'; }
 auth() {
     curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$(docker exec "$LND" xxd -p -c 10000 /data/admin.macaroon)" "$URL/v1/$1"
+}
+funded() { auth balance/blockchain | jq -e '.confirmed_balance | tonumber >= 100000000'; }
+channel_open() { auth channels | jq -e '.channels | length == 1'; }
+channels() { auth channels | jq -Sc '[.channels[] | {channel_point,remote_pubkey,capacity,local_balance,remote_balance}]'; }
+peer_info() {
+    curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$(docker exec "$PEER" xxd -p -c 10000 /data/admin.macaroon)" "$PEER_URL/v1/getinfo"
 }
 ready() { docker logs "$LND" 2>&1 | grep -q 'Wallet ready; verified credentials'; }
 failed() { docker logs "$LND" 2>&1 | grep -q 'Automatic initialization/unlock stopped'; }
@@ -104,6 +111,31 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
         wait_for auth getinfo
         IDENTITY=$(auth getinfo | jq -r .identity_pubkey)
         OLD_MACAROON=$(docker exec "$LND" xxd -p -c 10000 /data/admin.macaroon)
+        if [[ "$SCENARIO" == password-only ]]; then
+            # Verify a funded channel and its backup, not only an empty wallet.
+            printf '%s\n' "${CONFIG/restlisten=lnd/restlisten=0.0.0.0}" > "$WORK/peer.conf"
+            docker create --name "$PEER" --network "$NAME" --network-alias peer \
+                --entrypoint /bin/lnd "$IMAGE" --lnddir=/data >/dev/null
+            docker cp "$WORK/peer.conf" "$PEER:/data/lnd.conf"
+            docker start "$PEER" >/dev/null
+            PEER_URL=http://$(docker inspect "$PEER" | jq -r --arg n "$NAME" '.[0].NetworkSettings.Networks[$n].IPAddress'):8080
+            wait_for curl -sf --max-time 5 "$PEER_URL/v1/genseed"
+            curl -sf "$PEER_URL/v1/genseed" | jq -c '{wallet_password:("disposable-peer-password" | @base64),cipher_seed_mnemonic}' |
+                curl -sf --data-binary @- "$PEER_URL/v1/initwallet" >/dev/null
+            wait_for peer_info
+            bitcoin sendtoaddress "$(auth newaddress | jq -r .address)" 1 >/dev/null
+            bitcoin generatetoaddress 6 "$(bitcoin getnewaddress)" >/dev/null
+            wait_for funded
+            PEER_KEY=$(peer_info | jq -r .identity_pubkey)
+            jq -nc --arg key "$PEER_KEY" '{addr:{pubkey:$key,host:"peer:9735"},perm:true}' |
+                curl -sf -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/peers" >/dev/null
+            jq -nc --arg key "$PEER_KEY" '{node_pubkey_string:$key,local_funding_amount:"1000000",private:true}' |
+                curl -sf -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/channels" >/dev/null
+            bitcoin generatetoaddress 6 "$(bitcoin getnewaddress)" >/dev/null
+            wait_for channel_open
+            CHANNELS=$(channels)
+            BACKUP_POINTS=$(auth channels/backup | jq -Sc .multi_chan_backup.chan_points)
+        fi
         CUSTOM_MACAROON=$(curl -sf -H "Grpc-Metadata-macaroon:$OLD_MACAROON" \
             -d '{"permissions":[{"entity":"info","action":"read"}],"root_key_id":"7"}' "$URL/v1/macaroon" | jq -er .macaroon)
         BINARY=$(docker exec "$LND" sha256sum /bin/lnd)
@@ -193,6 +225,10 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
                     fi
                 done
             fi
+            if [[ "$SCENARIO" == password-only ]]; then
+                [[ $(channels) == "$CHANNELS" ]]
+                [[ $(auth channels/backup | jq -Sc .multi_chan_backup.chan_points) == "$BACKUP_POINTS" ]]
+            fi
             for FILE in "$WALLET" "$WALLET.recovery"; do
                 [[ $(docker exec "$LND" stat -c %a "$FILE") == 600 ]]
             done
@@ -216,6 +252,7 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
     [[ $(docker inspect "$LND" | jq -r '.[0].HostConfig.RestartPolicy.Name') == no ]]
     [[ $(docker inspect "$LND" | jq -r '.[0].RestartCount') == 0 ]]
     docker rm -fv "$LND" >/dev/null
+    if [[ "$SCENARIO" == password-only ]]; then docker rm -fv "$PEER" >/dev/null; fi
     docker volume rm "$VOLUME" >/dev/null
     echo "PASS $SCENARIO"
 done
