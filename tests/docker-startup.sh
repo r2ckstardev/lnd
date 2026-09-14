@@ -18,7 +18,7 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
-trap 'echo "FAIL ${SCENARIO:-setup} at test line $LINENO" >&2; docker logs --tail 25 "$LND" >&2 || true' ERR
+trap 'echo "FAIL ${SCENARIO:-setup} at test line $LINENO" >&2; docker logs --tail 25 "$LND" >&2 || true; docker logs --tail 15 "$PEER" >&2 || true' ERR
 wait_for() {
     for ((i=0; i<120; i++)); do
         if "$@" >/dev/null 2>&1; then return 0; fi
@@ -115,7 +115,7 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy newline stored-newline empty null omitt
         if [[ "$SCENARIO" == password-only ]]; then
             # Verify a funded channel and its backup, not only an empty wallet.
             echo "Creating disposable channel peer"
-            printf '%s\n' "${CONFIG/restlisten=lnd/restlisten=0.0.0.0}" > "$WORK/peer.conf"
+            printf '%s\n' "${CONFIG/restlisten=lnd/restlisten=peer}" > "$WORK/peer.conf"
             docker create --name "$PEER" --network "$NAME" --network-alias peer \
                 --entrypoint /bin/lnd "$IMAGE" --lnddir=/data >/dev/null
             docker cp "$WORK/peer.conf" "$PEER:/data/lnd.conf"
