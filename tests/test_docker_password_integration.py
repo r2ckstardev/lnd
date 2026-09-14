@@ -109,7 +109,7 @@ class DockerMigrationTests(unittest.TestCase):
         args = [
             "run", "-d", "--name", self.name, "--network", self.network,
             "--network-alias", "lnd",
-            "-v", self.volume + ":/data", "-p", "127.0.0.1::8080",
+            "-v", self.volume + ":/data",
         ]
         if overlay:
             args += [
@@ -129,15 +129,16 @@ class DockerMigrationTests(unittest.TestCase):
                 else:
                     args.append("--" + setting)
         docker(*args)
-        def port_mapping():
+        def container_address():
             state = json.loads(docker("inspect", self.name))[0]
             if state["State"]["Status"] == "exited":
                 raise AssertionError(docker("logs", self.name, check=False).decode())
-            mapping = state["NetworkSettings"]["Ports"].get("8080/tcp")
-            return mapping[0]["HostPort"] if mapping else None
+            return state["NetworkSettings"]["Networks"][self.network]["IPAddress"]
 
-        port = wait_for(port_mapping)
-        self.url = "http://127.0.0.1:" + port
+        # The Linux Docker host can reach its internal bridge directly; no
+        # port publishing or external network access is needed by this test.
+        address = wait_for(container_address)
+        self.url = "http://" + address + ":8080"
 
     def request(self, endpoint, payload=None, authenticated=False):
         headers = {"Content-Type": "application/json"}
