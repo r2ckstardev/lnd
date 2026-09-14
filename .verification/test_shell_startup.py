@@ -10,7 +10,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SCRIPT = Path(__file__).resolve().parents[1] / "docker-initunlocklnd.sh"
+SCRIPT = Path(os.environ.get("STARTUP_SCRIPT", Path(__file__).resolve().parents[1] / "docker-initunlocklnd.sh"))
 
 
 class StartupTests(unittest.TestCase):
@@ -94,7 +94,8 @@ class StartupTests(unittest.TestCase):
                 if changing:
                     record = fixture.read_record()
                     new = base64.b64decode(request["new_password"]).decode()
-                    fixture.durable.append(record["password"] == new and record["pending"] and json.loads(fixture.unlock.read_text())["wallet_password_pending"] == new)
+                    metadata_saved = not fixture.unlock.exists() or json.loads(fixture.unlock.read_text())["wallet_password_pending"] == new
+                    fixture.durable.append(record["password"] == new and record["pending"] and metadata_saved)
                     fixture.password = new
                     if fixture.mode == "store-error" or supplied != fixture.store_password:
                         self.reply({"code": 2, "message": "invalid password"}, 500)
@@ -172,6 +173,36 @@ class StartupTests(unittest.TestCase):
         self.run_script()
         self.assertEqual(self.password, "custom password\n")
         self.assertEqual(self.rotations, 1)
+
+    def recovery_only(self, pending):
+        original = "hellorockstar" if pending else "custom password\n"
+        target = "saved-before-request" if pending else original
+        self.password = self.store_password = original
+        self.unlock.unlink()
+        self.recovery.write_text(json.dumps({"version": 1, "password": target,
+            "old_passwords": [original], "pending": pending, "migrate": pending,
+            "initializing": False, "rotation_id": ""}))
+        self.run_script(prepare=True)
+        self.run_script()
+        self.assertEqual(self.password, target)
+        self.assertTrue(self.durable and all(self.durable))
+        self.assertFalse(self.read_record()["pending"])
+        self.assertEqual(self.read_record()["old_passwords"], [original])
+        self.assertEqual(self.read_record()["rotation_id"], "test")
+        self.assertFalse(self.unlock.exists())
+        self.assertEqual(self.recovery.stat().st_mode & 0o777, 0o600)
+        completed = self.read_record()
+        self.locked = True
+        self.run_script()
+        self.assertEqual(self.rotations, 1)
+        self.assertEqual(self.read_record(), completed)
+        self.assertFalse(self.unlock.exists())
+
+    def test_recovery_only_rotation(self):
+        self.recovery_only(False)
+
+    def test_recovery_only_pending_migration(self):
+        self.recovery_only(True)
 
     def test_lost_response_keeps_originals(self):
         self.mode = "lost-response"

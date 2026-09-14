@@ -18,6 +18,8 @@ jobs:
             scenarios: pending-before pending-after missing-store-old missing-store-new missing-readonly split-store unknown invalid-json fresh interrupted-init
           - group: channel
             scenarios: password-only
+          - group: recovery-only
+            scenarios: recovery-rotation recovery-pending
     steps:
       - uses: actions/checkout@v5
       - name: Shell syntax
@@ -28,6 +30,20 @@ jobs:
       - name: Supplementary failure injection (outside the PR)
         if: matrix.group == 'passwords'
         run: python3 .verification/test_shell_startup.py
+      - name: Reproduce Copilot finding against the previous script
+        if: matrix.group == 'recovery-only'
+        run: |
+          git fetch --no-tags --depth=1 origin fc1460b48e541ee5b8004ef9ce6019fad9e4ca6a
+          git show FETCH_HEAD:docker-initunlocklnd.sh > /tmp/startup-before-review.sh
+          if STARTUP_SCRIPT=/tmp/startup-before-review.sh python3 .verification/test_shell_startup.py \
+              StartupTests.test_recovery_only_rotation StartupTests.test_recovery_only_pending_migration > /tmp/regression.log 2>&1; then
+            cat /tmp/regression.log
+            echo 'Expected both recovery-only cases to fail before the fix'
+            exit 1
+          fi
+          cat /tmp/regression.log
+          grep -q 'FAILED (failures=2)' /tmp/regression.log
+          grep -q 'Filesystem error reading .*walletunlock.json' /tmp/regression.log
       - name: Released LND integration
         env:
           TEST_SCENARIOS: ${{ matrix.scenarios }}

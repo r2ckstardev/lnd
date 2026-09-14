@@ -269,9 +269,11 @@ else
             if [[ "$MIGRATE" == true ]]; then FINAL_PASSWORD=$FIRST; fi
             RECORD=$(FINAL_PASSWORD=$FINAL_PASSWORD jq -c '.password=(env.FINAL_PASSWORD | @base64d) | .pending=true' <<< "$RECORD")
             save_record
-            CURRENT_METADATA=$(read_json "$UNLOCK")
-            printf '%s\n%s\n' "$CURRENT_METADATA" "$RECORD" | jq -cs '.[0] + {wallet_password_pending:.[1].password}' |
-                save_json "$UNLOCK" || fail "Filesystem error saving pending state at $UNLOCK."
+            if [[ -f "$UNLOCK" ]]; then
+                CURRENT_METADATA=$(read_json "$UNLOCK")
+                printf '%s\n%s\n' "$CURRENT_METADATA" "$RECORD" | jq -cs '.[0] + {wallet_password_pending:.[1].password}' |
+                    save_json "$UNLOCK" || fail "Filesystem error saving pending state at $UNLOCK."
+            fi
         fi
         REQUEST=$(CURRENT_PASSWORD=$CURRENT_PASSWORD FINAL_PASSWORD=$FINAL_PASSWORD ROTATE=$ROTATE ENDPOINT=$ENDPOINT jq -nc '
             if env.ENDPOINT == "changepassword" then
