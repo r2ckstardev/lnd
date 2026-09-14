@@ -68,10 +68,8 @@ if [ -f "$WALLET_FILE" ]; then
         if [ "$WALLETPASS" == "" ] || [ "$WALLETPASS" == "null" ]; then
             WALLETPASS="hellorockstar"
         fi
-        # Corrected password (removing newlines before encoding).
-        # previous versions will have a default wallet password including a line feed at the end "hellorockstar\n"
-        # line feed hex code 0x0A. So we first try the password without the line feed if it fails we try it with
-        # the older version.
+        # Preserve the exact password in JSON, including any stored newline.
+        # Legacy files sometimes omit the newline that was sent to LND.
         WALLETPASS_BASE64=$(jq -r '(.wallet_password // "") |
             if . == "" then "hellorockstar" else . end | @base64' "$LNDUNLOCK_FILE")
 
@@ -79,12 +77,7 @@ if [ -f "$WALLET_FILE" ]; then
         # Save every candidate BEFORE the RPC. Keep the existing password and
         # seed fields, and retain the history even after a successful change.
         PENDING_PASSWORD=$(jq -r 'has("wallet_password_pending")' "$LNDUNLOCK_FILE")
-        MIGRATE_DEFAULT=0
         if [[ "$WALLETPASS" == "hellorockstar" || "$PENDING_PASSWORD" == true ]]; then
-            MIGRATE_DEFAULT=1
-        fi
-
-        if [[ $MIGRATE_DEFAULT == 1 ]]; then
             if [[ "$PENDING_PASSWORD" == true ]]; then
                 NEWPASS=$(jq -er '.wallet_password_pending | select(type == "string" and length >= 8)' "$LNDUNLOCK_FILE")
             else
@@ -111,9 +104,12 @@ if [ -f "$WALLET_FILE" ]; then
             # Retrying from the candidate also finishes a rotation whose
             # response was lost. Only a wrong wallet password permits fallback.
             for CURRENT_PASSWORD in "${PASSWORDS[@]}"; do
-                rotate_response=$(curl -sS --max-time 120 --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
+                if ! rotate_response=$(curl -sS --max-time 120 --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
                     -d "{\"current_password\":\"$CURRENT_PASSWORD\",\"new_password\":\"$NEWPASS_BASE64\",\"new_macaroon_root_key\":${LND_PASSWORD_ROTATE_MACAROONS:-false}}" \
-                    "$LND_REST_LISTEN_HOST/v1/changepassword")
+                    "$LND_REST_LISTEN_HOST/v1/changepassword"); then
+                    echo "[initunlocklnd] Request outcome unknown; passwords are preserved in $LNDUNLOCK_FILE"
+                    exit 1
+                fi
                 if ! jq -e '.message == "invalid passphrase for master public key"' >/dev/null <<< "$rotate_response"; then
                     break
                 fi

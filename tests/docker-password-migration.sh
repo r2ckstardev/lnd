@@ -54,7 +54,7 @@ adminmacaroonpath=/data/admin.macaroon
 readonlymacaroonpath=/data/readonly.macaroon
 invoicemacaroonpath=/data/invoice.macaroon'
 
-for SCENARIO in legacy newline stored-newline password-only rotation-only custom-newline interrupted-before interrupted-after; do
+for SCENARIO in legacy newline stored-newline password-only rotation-only custom-newline interrupted-before interrupted-after missing-store; do
     echo "Testing $SCENARIO"
     LEGACY=hellorockstar
     STORED=hellorockstar
@@ -98,6 +98,11 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
     fi
     docker stop "$LND" >/dev/null
     docker rm "$LND" >/dev/null
+    if [[ "$SCENARIO" == missing-store ]]; then
+        # Reproduce the original partial commit with an already absent store.
+        docker run --rm -v "$VOLUME:/data" --entrypoint sh "$IMAGE" \
+            -c 'rm -f /data/data/chain/bitcoin/regtest/macaroons.db'
+    fi
 
     # Docker's default restart policy is "no". Each upgrade must finish in
     # this process, without a crash/restart being part of the migration.
@@ -107,6 +112,23 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
         -e LND_CHAIN=btc -e LND_ENVIRONMENT=regtest -e "LND_EXTRA_ARGS=$CONFIG" \
         -e LND_REST_LISTEN_HOST=http://lnd:8080 -e "LND_MACAROON_ROTATION_ID=$ROTATION" "$IMAGE" >/dev/null
     URL=http://$(address):8080
+    if [[ "$SCENARIO" == missing-store ]]; then
+        failed() { docker logs "$LND" 2>&1 | grep -q 'migration is not complete'; }
+        wait_for failed
+        saved | jq -e '.wallet_password == "hellorockstar" and
+            (.wallet_password_pending | length == 44) and .unrelated.keep' >/dev/null
+        docker exec "$LND" test ! -f /data/.macaroon-rotated-test
+        docker logs "$LND" 2>&1 | grep -q 'default root key not found'
+        # Explicit operator recovery, not automatic repair: use the preserved
+        # candidate and recreate authentication data after stopping LND.
+        RECOVERED=$(saved | jq '.wallet_password = .wallet_password_pending | del(.wallet_password_pending)')
+        docker stop "$LND" >/dev/null
+        docker run --rm -i -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c \
+            'cat > /data/data/chain/bitcoin/regtest/walletunlock.json
+             rm -f /data/data/chain/bitcoin/regtest/macaroons.db /data/admin.macaroon /data/readonly.macaroon /data/invoice.macaroon' <<< "$RECOVERED"
+        docker start "$LND" >/dev/null
+        URL=http://$(address):8080
+    fi
     wait_for ready
     SAVED=$(saved)
     [[ $(info | jq -r .identity_pubkey) == "$IDENTITY" ]]
@@ -131,7 +153,7 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
     for FILE in admin readonly invoice; do docker exec "$LND" test -s "/data/$FILE.macaroon"; done
     [[ $(docker inspect "$LND" | jq -r '.[0].HostConfig.RestartPolicy.Name') == no ]]
     [[ $(docker inspect "$LND" | jq -r '.[0].RestartCount') == 0 ]]
-    if docker logs "$LND" 2>&1 | grep -q 'default root key not found'; then exit 1; fi
+    if [[ "$SCENARIO" != missing-store ]] && docker logs "$LND" 2>&1 | grep -q 'default root key not found'; then exit 1; fi
     docker restart "$LND" >/dev/null
     wait_for info
     [[ $(saved) == "$SAVED" ]]
