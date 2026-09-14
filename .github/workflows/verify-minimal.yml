@@ -1,0 +1,27 @@
+name: Isolated startup verification
+on:
+  push:
+    branches: [verification/minimal-password-migration]
+permissions:
+  contents: read
+jobs:
+  startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash -n docker-entrypoint.sh && bash -n docker-initunlocklnd.sh && bash -n tests/docker-password-migration.sh
+      - name: Additional failure-injection checks outside the PR
+        run: |
+          python3 - <<'PY'
+          import importlib.util, pathlib, unittest
+          spec = importlib.util.spec_from_file_location('fixture', '.verification/test_migration.py')
+          fixture = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(fixture)
+          fixture.SCRIPT = pathlib.Path.cwd() / 'docker-initunlocklnd.sh'
+          names = unittest.TestLoader().getTestCaseNames(fixture.MigrationTests)
+          names = [n for n in names if n not in ('test_prepare_preserves_auth_files_and_never_moves_wallet_data', 'test_completed_migration_requests_deferred_rotation')]
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(fixture.MigrationTests(n) for n in names))
+          raise SystemExit(not result.wasSuccessful())
+          PY
+      - run: bash tests/docker-password-migration.sh

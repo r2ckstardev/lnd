@@ -54,7 +54,9 @@ adminmacaroonpath=/data/admin.macaroon
 readonlymacaroonpath=/data/readonly.macaroon
 invoicemacaroonpath=/data/invoice.macaroon'
 
-for LEGACY in hellorockstar $'hellorockstar\n'; do
+for SCENARIO in legacy newline interrupted; do
+    LEGACY=hellorockstar
+    if [[ "$SCENARIO" == newline ]]; then LEGACY=$'hellorockstar\n'; fi
     docker volume create "$VOLUME" >/dev/null
     docker run --rm -i -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c 'cat > /data/lnd.conf' <<< "$CONFIG"
     docker run -d --name "$LND" --network "$NAME" --network-alias lnd \
@@ -68,7 +70,9 @@ for LEGACY in hellorockstar $'hellorockstar\n'; do
     IDENTITY=$(info | jq -r .identity_pubkey)
     OLD_MACAROON=$(docker exec "$LND" xxd -p -c 10000 /data/admin.macaroon)
     BINARY=$(docker exec "$LND" sha256sum /bin/lnd)
-    jq -cn --argjson seed "$SEED" '{wallet_password:"hellorockstar",cipher_seed_mnemonic:$seed}' \
+    jq -cn --argjson seed "$SEED" --arg scenario "$SCENARIO" \
+        '{wallet_password:"hellorockstar",cipher_seed_mnemonic:$seed} +
+        (if $scenario == "interrupted" then {wallet_password_pending:"saved-before-the-request"} else {} end)' \
         | docker exec -i "$LND" sh -c "cat > $WALLET"
     docker stop "$LND" >/dev/null
     docker rm "$LND" >/dev/null
@@ -93,4 +97,4 @@ for LEGACY in hellorockstar $'hellorockstar\n'; do
     docker rm -fv "$LND" >/dev/null
     docker volume rm "$VOLUME" >/dev/null
 done
-echo 'PASS: rotation, both legacy passwords, partial-change recovery and subsequent restart'
+echo 'PASS: rotation, both legacy passwords, interrupted migration and subsequent restart'
