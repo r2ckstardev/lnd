@@ -52,7 +52,7 @@ rpc_failed() {
             fail "Database busy or request timed out. Inspect LND's logs; saved credentials are retained at $RECOVERY." ;;
         *permission\ denied*|*read-only\ file\ system*|*no\ space\ left*)
             fail "Filesystem error during the wallet request. Inspect LND's logs; saved credentials are retained at $RECOVERY." ;;
-        *macaroon*|*root\ key*|*could\ not\ create\ unlock*|*could\ not\ change\ password*)
+        invalid\ password|*macaroon*|*root\ key*|*could\ not\ create\ unlock*|*could\ not\ change\ password*)
             manual_auth "LND rejected the request for a reason other than the recognized wrong-wallet-password error; the wallet password may already have changed" ;;
         *)
             fail "Unexpected LND response; password acceptance and migration completion are unconfirmed. Inspect LND's logs; saved credentials remain at $RECOVERY." ;;
@@ -71,6 +71,7 @@ METADATA='{}'
 MACAROONS=("$WALLET_DIR/admin.macaroon" "$WALLET_DIR/readonly.macaroon" "$WALLET_DIR/invoice.macaroon")
 
 # Fail explicitly for storage overrides rather than inspect a different wallet.
+[[ "$LND_DATA" == /* ]] || fail "Unsupported configuration: LND_DATA must be an absolute path."
 [[ "$1" == bitcoin && "$2" =~ ^(mainnet|testnet|signet|regtest)$ ]] ||
     fail "Unsupported storage/configuration: expected a Bitcoin network."
 while IFS= read -r line; do
@@ -118,10 +119,12 @@ if [[ -e "$UNLOCK" ]]; then
 fi
 if [[ -e "$RECOVERY" ]]; then
     RECORD=$(read_json "$RECOVERY")
-    jq -e '.version == 1 and (.password | type == "string" and length >= 8) and
-        (.old_passwords | type == "array" and length <= 4 and all(.[]; type == "string" and length > 0)) and
+    jq -e '.version == 1 and (.password | type == "string" and length >= 8 and length <= 4096) and
+        (.old_passwords | type == "array" and length <= 4 and all(.[]; type == "string" and length > 0 and length <= 4096)) and
         (.pending | type == "boolean") and (.migrate | type == "boolean") and (.initializing | type == "boolean") and
-        (.rotation_id | type == "string")' >/dev/null <<< "$RECORD" ||
+        (.rotation_id | type == "string") and
+        (keys - ["version","password","old_passwords","pending","migrate","initializing","rotation_id"] | length == 0) and
+        (.initializing == false or (.pending == false and .migrate == false))' >/dev/null <<< "$RECORD" ||
         fail "Invalid metadata at $RECOVERY: invalid recovery record."
     # Older BTCPay may write stale password data when removing the seed.
     if ! printf '%s\n%s\n' "$METADATA" "$RECORD" | jq -es '
@@ -160,7 +163,8 @@ else
     else
         # Only our saved initialization record authorizes resuming a node
         # whose databases were created before InitWallet finished.
-        evidence=$(find "$LND_DATA" -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.macaroon' -o -name 'channel.backup' \) -print -quit) ||
+        evidence=$(find "$LND_DATA" -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.macaroon' -o \
+            -name 'channel.backup' -o -name 'lnd.log' -o -name 'walletunlock.json.password-history' \) -print -quit) ||
             fail "Filesystem error inspecting $LND_DATA."
         [[ -z "$evidence" ]] ||
             fail "Manual recovery required: wallet.db is missing but existing node data remains. No replacement seed will be generated."
@@ -170,6 +174,10 @@ else
             (.cipher_seed_mnemonic | type == "array" and length == 24 and all(.[]; type == "string" and test("^[a-z]+$"))) and
             (has("wallet_password_pending") | not)' >/dev/null <<< "$METADATA" ||
             fail "Invalid metadata at $UNLOCK: incomplete initialization request."
+    fi
+    if printf '%s\n%s\n' "$METADATA" "$RECORD" | jq -es '
+        (.[0].wallet_password // .[1].password) | . == "hellorockstar" or . == "hellorockstar\n"' >/dev/null; then
+        fail "Manual preparation required: the saved initialization request uses the shared legacy password. Preserve its seed and credentials; do not initialize another wallet with that password."
     fi
 fi
 

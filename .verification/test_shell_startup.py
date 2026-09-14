@@ -97,7 +97,7 @@ class StartupTests(unittest.TestCase):
                     fixture.durable.append(record["password"] == new and record["pending"] and json.loads(fixture.unlock.read_text())["wallet_password_pending"] == new)
                     fixture.password = new
                     if fixture.mode == "store-error" or supplied != fixture.store_password:
-                        self.reply({"code": 2, "message": "could not create unlock: invalid password"}, 500)
+                        self.reply({"code": 2, "message": "invalid password"}, 500)
                         return
                     fixture.store_password = new
                     if request.get("new_macaroon_root_key"):
@@ -328,6 +328,25 @@ exec /usr/bin/mv "$@"''')
         self.run_script()
         self.assertEqual(self.seed_requests, 0)
         self.assertEqual(json.loads(self.unlock.read_text()), first)
+
+    def test_legacy_initialization_requires_manual_preparation(self):
+        self.fresh()
+        record = self.read_record()
+        record["password"] = "hellorockstar"
+        self.recovery.write_text(json.dumps(record))
+        self.assertIn("shared legacy password", self.run_script(False, True))
+        self.assertFalse(self.calls)
+
+    def test_custom_newline_rotation_retry_keeps_exact_password(self):
+        self.password = self.store_password = "custom password\n"
+        self.write_metadata({"wallet_password": "custom password"})
+        self.mode = "lost-response"
+        self.run_script(False)
+        self.mode = "success"
+        self.locked = True
+        self.run_script()
+        self.assertEqual(self.password, "custom password\n")
+        self.assertFalse(self.read_record()["migrate"])
 
     def test_failure_after_record_rename_no_request(self):
         self.wrapper("sync", '''count_file="$LND_DATA/sync-count"
