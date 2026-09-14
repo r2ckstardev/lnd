@@ -19,3 +19,33 @@ jobs:
         run: python3 .verification/test_shell_startup.py
       - name: Released LND integration
         run: bash tests/docker-startup.sh
+  architecture-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+          - platform: linux/arm/v7
+            suffix: arm32v7
+          - platform: linux/arm64
+            suffix: arm64v8
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - name: Run shell preflight in released architecture image
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          docker run --rm --platform "$PLATFORM" \
+            -v "$PWD/docker-initunlocklnd.sh:/docker-initunlocklnd.sh:ro" \
+            -e LND_DATA=/data --entrypoint bash "btcpayserver/lnd:v0.21.3-beta-1-$SUFFIX" -c '
+              set -e
+              bash -n /docker-initunlocklnd.sh
+              printf "bitcoin.regtest=1\n" > /data/lnd.conf
+              /docker-initunlocklnd.sh bitcoin regtest --prepare lnd
+              test "$(stat -c %a /data/data/chain/bitcoin/regtest/walletunlock.json.recovery)" = 600
+              jq -e ".initializing and (.password | length == 44)" /data/data/chain/bitcoin/regtest/walletunlock.json.recovery >/dev/null
+            '

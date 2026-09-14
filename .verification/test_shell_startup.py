@@ -34,6 +34,7 @@ class StartupTests(unittest.TestCase):
         self.locked = True
         self.calls = []
         self.rotations = 0
+        self.seed_requests = 0
         self.mode = "success"
         self.durable = []
         self.bin = self.data / "bin"
@@ -54,15 +55,34 @@ class StartupTests(unittest.TestCase):
 
             def do_GET(self):
                 if self.path.endswith("state"):
-                    self.reply({"state": "LOCKED" if fixture.locked else "RPC_ACTIVE"})
+                    self.reply({"state": "NON_EXISTING" if not fixture.wallet.exists() else "LOCKED" if fixture.locked else "RPC_ACTIVE"})
                 elif self.path.endswith("getinfo"):
                     self.reply({"identity_pubkey": "fixture"}, 500 if fixture.locked else 200)
+                elif self.path.endswith("genseed"):
+                    fixture.seed_requests += 1
+                    self.reply({"cipher_seed_mnemonic": [None] if fixture.mode == "invalid-seed" else ["abandon"] * 24})
                 else:
                     self.reply({"code": 5}, 404)
 
             def do_POST(self):
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fixture.calls.append((self.path, request))
+                if self.path.endswith("initwallet"):
+                    saved = json.loads(fixture.unlock.read_text())
+                    supplied = base64.b64decode(request["wallet_password"]).decode()
+                    fixture.durable.append(saved["wallet_password"] == supplied and saved["cipher_seed_mnemonic"] == request["cipher_seed_mnemonic"])
+                    fixture.password = fixture.store_password = supplied
+                    fixture.wallet.write_bytes(b"initialized wallet")
+                    (fixture.wallet_dir / "macaroons.db").write_bytes(b"store")
+                    for name in ("admin", "readonly", "invoice"):
+                        (fixture.wallet_dir / (name + ".macaroon")).write_bytes(b"token")
+                    fixture.locked = False
+                    if fixture.mode == "lost-response":
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                    else:
+                        self.reply({"admin_macaroon": "fixture"})
+                    return
                 changing = self.path.endswith("changepassword")
                 supplied = base64.b64decode(request["current_password" if changing else "wallet_password"]).decode()
                 if fixture.mode == "busy":
@@ -266,6 +286,70 @@ exec /usr/bin/mv "$@"''')
         self.locked = True
         self.run_script()
         self.assertEqual(self.rotations, 1)
+
+    def fresh(self):
+        for path in self.wallet_dir.iterdir():
+            path.unlink()
+        self.run_script(prepare=True)
+
+    def test_initialization_saved_before_request(self):
+        self.fresh()
+        initial = self.read_record()["password"]
+        self.run_script()
+        self.assertEqual(self.password, initial)
+        self.assertEqual(self.seed_requests, 1)
+        self.assertTrue(all(self.durable))
+        self.assertEqual(self.recovery.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.unlock.stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_seed_is_not_saved_or_submitted(self):
+        self.fresh()
+        self.mode = "invalid-seed"
+        self.assertIn("Invalid seed response", self.run_script(False))
+        self.assertFalse(self.unlock.exists())
+        self.assertFalse(self.calls)
+
+    def test_initialization_lost_response_reuses_password(self):
+        self.fresh()
+        self.mode = "lost-response"
+        self.run_script(False)
+        first = json.loads(self.unlock.read_text())
+        self.mode = "success"
+        self.locked = True
+        self.run_script()
+        self.assertEqual(json.loads(self.unlock.read_text()), first)
+        self.assertEqual(self.seed_requests, 1)
+        self.assertEqual(sum(path.endswith("initwallet") for path, _ in self.calls), 1)
+
+    def test_saved_initialization_request_reused(self):
+        self.fresh()
+        first = {"wallet_password": self.read_record()["password"], "cipher_seed_mnemonic": ["abandon"] * 24}
+        self.write_metadata(first)
+        self.run_script()
+        self.assertEqual(self.seed_requests, 0)
+        self.assertEqual(json.loads(self.unlock.read_text()), first)
+
+    def test_failure_after_record_rename_no_request(self):
+        self.wrapper("sync", '''count_file="$LND_DATA/sync-count"
+count=$(cat "$count_file" 2>/dev/null || echo 0)
+echo $((count+1)) > "$count_file"
+[[ $count -eq 1 ]] && exit 1
+exec /usr/bin/sync''')
+        self.run_script(False)
+        self.assertFalse(self.calls)
+        self.assertTrue(self.read_record()["pending"])
+
+    def test_completed_record_failure_preserves_recovery(self):
+        self.wrapper("mv", '''if [[ "${@: -1}" == *.recovery ]] && /usr/bin/jq -e '.pending == false' "${@: -2:1}" >/dev/null; then exit 1; fi
+exec /usr/bin/mv "$@"''')
+        self.run_script(False)
+        self.assertTrue(self.read_record()["pending"])
+        self.assertEqual(self.read_record()["password"], self.password)
+        self.assertEqual(self.read_record()["old_passwords"], ["hellorockstar", "hellorockstar\n"])
+        (self.bin / "mv").unlink()
+        self.locked = True
+        self.run_script()
+        self.assertEqual(self.rotations, 2)
 
 
 if __name__ == "__main__":
