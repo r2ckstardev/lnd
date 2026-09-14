@@ -140,9 +140,11 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
         if [[ "$ROTATION" ]]; then [[ "$CODE" != 200 ]]; else [[ "$CODE" == 200 ]]; fi
     done
     if [[ "$STORED" == hellorockstar* ]]; then
-        saved | jq -e --arg old "$LEGACY" '.wallet_password_history | index($old) != null' >/dev/null
-        saved | jq -e '.wallet_password as $pw | .wallet_password_history | index($pw) != null' >/dev/null
+        HISTORY=$(docker exec "$LND" cat "$WALLET.password-history")
+        jq -e --arg old "$LEGACY" '[.[] | .old_password, .legacy_password] | index($old) != null' <<< "$HISTORY" >/dev/null
+        jq -e --arg pw "$(saved | jq -r .wallet_password)" '.[-1].new_password == $pw' <<< "$HISTORY" >/dev/null
         [[ $(docker exec "$LND" stat -c %a "$WALLET") == 600 ]]
+        [[ $(docker exec "$LND" stat -c %a "$WALLET.password-history") == 600 ]]
     else
         [[ $(saved | jq -r .wallet_password) == "$STORED" ]]
     fi

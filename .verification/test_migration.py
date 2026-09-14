@@ -29,6 +29,7 @@ class MigrationTests(unittest.TestCase):
         wallet_dir.mkdir(parents=True)
         (wallet_dir / "wallet.db").touch()
         self.unlock = wallet_dir / "walletunlock.json"
+        self.history = wallet_dir / "walletunlock.json.password-history"
         self.original = {
             "wallet_password": "hellorockstar",
             "cipher_seed_mnemonic": ["seed", "words", "preserved"],
@@ -82,10 +83,11 @@ class MigrationTests(unittest.TestCase):
 
                 replacement = base64.b64decode(body["new_password"]).decode()
                 saved = fixture.read_unlock()
+                history = json.loads(fixture.history.read_text())[-1]
                 fixture.durable_requests.append(
                     saved.get("wallet_password_pending") == replacement
-                    and replacement in saved.get("wallet_password_history", [])
-                    and supplied in saved.get("wallet_password_history", [])
+                    and history["new_password"] == replacement
+                    and supplied in history.values()
                 )
                 if fixture.mode == "reject":
                     self.reply({"code": 2, "message": "database unavailable"}, 500)
@@ -141,9 +143,11 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(saved["cipher_seed_mnemonic"], self.original["cipher_seed_mnemonic"])
         self.assertEqual(saved["unrelated"], self.original["unrelated"])
         self.assertTrue(all(self.durable_requests))
-        self.assertIn(self.password, saved["wallet_password_history"])
-        self.assertIn("hellorockstar", saved["wallet_password_history"])
-        self.assertIn("hellorockstar\n", saved["wallet_password_history"])
+        history = json.loads(self.history.read_text())[-1]
+        self.assertEqual(self.password, history["new_password"])
+        self.assertEqual("hellorockstar", history["old_password"])
+        self.assertEqual("hellorockstar\n", history["legacy_password"])
+        self.assertNotIn("cipher_seed_mnemonic", self.history.read_text())
 
     def test_migration_and_next_restart(self):
         result = self.run_helper()
@@ -287,10 +291,24 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.password, "custom with spaces\n")
 
     def test_history_is_retained_on_another_migration(self):
-        self.write_unlock(self.original | {"wallet_password_history": ["previous-private-password"]})
+        original_history = [{"new_password": "previous-private-password"}]
+        self.history.write_text(json.dumps(original_history))
         result = self.run_helper()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("previous-private-password", self.read_unlock()["wallet_password_history"])
+        self.assertEqual(json.loads(self.history.read_text())[0], original_history[0])
+
+    def test_legacy_seed_removal_cannot_erase_saved_password(self):
+        self.mode = "lost_response"
+        result = self.run_helper()
+        self.assertNotEqual(result.returncode, 0)
+        pending = self.password
+        self.original["cipher_seed_mnemonic"] = ["Seed removed"]
+        self.write_unlock(self.original)
+        self.mode, self.locked = "success", True
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.password, pending)
+        self.assert_completed()
 
     def test_prepare_preserves_auth_files_and_never_moves_wallet_data(self):
         saved = self.original | {"wallet_password_pending": "uncertain-saved-password"}

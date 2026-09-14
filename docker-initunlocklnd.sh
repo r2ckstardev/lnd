@@ -2,12 +2,17 @@
 set -e
 umask 077
 
-save_unlock_file() {
-    local temporary
-    temporary=$(mktemp "$LNDUNLOCK_FILE.tmp.XXXXXX")
-    jq -c "$@" "$LNDUNLOCK_FILE" > "$temporary"
+save_json_file() {
+    local file=$1 temporary
+    shift
+    temporary=$(mktemp "$file.tmp.XXXXXX")
+    if [[ -f "$file" ]]; then
+        jq -c "$@" "$file" > "$temporary"
+    else
+        jq -nc "$@" > "$temporary"
+    fi
     sync
-    mv -f "$temporary" "$LNDUNLOCK_FILE"
+    mv -f "$temporary" "$file"
     sync
 }
 
@@ -78,8 +83,14 @@ if [ -f "$WALLET_FILE" ]; then
         # seed fields, and retain the history even after a successful change.
         PENDING_PASSWORD=$(jq -r 'has("wallet_password_pending")' "$LNDUNLOCK_FILE")
         if [[ "$WALLETPASS" == "hellorockstar" || "$PENDING_PASSWORD" == true ]]; then
+            PASSWORD_HISTORY="$LNDUNLOCK_FILE.password-history"
             if [[ "$PENDING_PASSWORD" == true ]]; then
                 NEWPASS=$(jq -er '.wallet_password_pending | select(type == "string" and length >= 8)' "$LNDUNLOCK_FILE")
+            elif [[ -f "$PASSWORD_HISTORY" ]]; then
+                # Older BTCPay versions can discard extra JSON fields when
+                # removing the seed. The separate history preserves this retry.
+                NEWPASS=$(jq -er '.[-1].new_password | select(type == "string" and length >= 8)' "$PASSWORD_HISTORY")
+                PENDING_PASSWORD=true
             else
                 NEWPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
                 [[ ${#NEWPASS} == 44 ]]
@@ -89,11 +100,12 @@ if [ -f "$WALLET_FILE" ]; then
             # password including a trailing line feed, so if the corrected
             # one fails we retry the rotation from that variant
             WALLETPASS_BASE64_CURRENT=$(printf '%s\n' "$WALLETPASS" | base64 | tr -d '\n')
-            save_unlock_file --arg pw "$NEWPASS" --arg old "$WALLETPASS_BASE64" \
+            # Never copy the seed into history: removing it must remain useful.
+            save_json_file "$PASSWORD_HISTORY" --arg pw "$NEWPASS" --arg old "$WALLETPASS_BASE64" \
                 --arg legacy "$WALLETPASS_BASE64_CURRENT" '
-                .wallet_password_pending = $pw |
-                .wallet_password_history = ((.wallet_password_history // []) +
-                    [($old | @base64d), ($legacy | @base64d), $pw] | unique)'
+                (. // []) + [{new_password:$pw, old_password:($old | @base64d),
+                    legacy_password:($legacy | @base64d)}]'
+            save_json_file "$LNDUNLOCK_FILE" --arg pw "$NEWPASS" '.wallet_password_pending = $pw'
 
             rotate_response=""
             PASSWORDS=("$WALLETPASS_BASE64" "$WALLETPASS_BASE64_CURRENT")
@@ -118,7 +130,7 @@ if [ -f "$WALLET_FILE" ]; then
             response=""
             if jq -e 'type == "object" and (. == {} or
                 (has("code") | not) and (.admin_macaroon | type == "string"))' >/dev/null <<< "$rotate_response"; then
-                save_unlock_file '.wallet_password = .wallet_password_pending | del(.wallet_password_pending)'
+                save_json_file "$LNDUNLOCK_FILE" --arg pw "$NEWPASS" '.wallet_password = $pw | del(.wallet_password_pending)'
                 if [[ "${LND_PASSWORD_ROTATE_MACAROONS:-false}" == true ]]; then
                     touch "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
                 fi
