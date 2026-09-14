@@ -226,7 +226,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.rotations, 1)
 
     def test_invalid_metadata_preflight(self):
-        for invalid in ("", "{", "[]", "{} {}", '{"wallet_password":7}', '{"wallet_password_pending":null}'):
+        for invalid in ("", "{", "[]", "{} {}", '{"wallet_password":7}', '{"wallet_password_pending":null}', '{"wallet_password_pending":"hellorockstar"}'):
             with self.subTest(invalid=invalid):
                 self.unlock.write_text(invalid)
                 output = self.run_script(False, True)

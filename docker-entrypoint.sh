@@ -4,7 +4,7 @@ set -e
 if [[ "$1" == "lnd" ]]; then
 	mkdir -p "$LND_DATA"
 
-    # removing noseedbackup=1 flag, adding it below if needed for legacy
+    # Use saved credentials instead of legacy noseedbackup initialization.
     LND_EXTRA_ARGS=${LND_EXTRA_ARGS/noseedbackup=1/}
     
 	cat <<-EOF > "$LND_DATA/lnd.conf"

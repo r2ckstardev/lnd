@@ -114,7 +114,8 @@ if [[ -e "$UNLOCK" ]]; then
     METADATA=$(read_json "$UNLOCK")
     jq -e '(.wallet_password == null or (.wallet_password | type == "string")) and
         ((has("wallet_password_pending") | not) or
-        (.wallet_password_pending | type == "string" and length >= 8))' >/dev/null <<< "$METADATA" ||
+        (.wallet_password_pending | type == "string" and length >= 8 and
+            . != "hellorockstar" and . != "hellorockstar\n"))' >/dev/null <<< "$METADATA" ||
         fail "Invalid metadata at $UNLOCK: invalid password field."
 fi
 if [[ -e "$RECOVERY" ]]; then
@@ -124,7 +125,8 @@ if [[ -e "$RECOVERY" ]]; then
         (.pending | type == "boolean") and (.migrate | type == "boolean") and (.initializing | type == "boolean") and
         (.rotation_id | type == "string") and
         (keys - ["version","password","old_passwords","pending","migrate","initializing","rotation_id"] | length == 0) and
-        (.initializing == false or (.pending == false and .migrate == false))' >/dev/null <<< "$RECORD" ||
+        (.initializing == false or (.pending == false and .migrate == false)) and
+        (.pending == false or .migrate == false or (.password != "hellorockstar" and .password != "hellorockstar\n"))' >/dev/null <<< "$RECORD" ||
         fail "Invalid metadata at $RECOVERY: invalid recovery record."
     # Older BTCPay may write stale password data when removing the seed.
     if ! printf '%s\n%s\n' "$METADATA" "$RECORD" | jq -es '
