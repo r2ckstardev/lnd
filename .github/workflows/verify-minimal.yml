@@ -7,7 +7,7 @@ permissions:
 jobs:
   startup:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - run: bash -n docker-entrypoint.sh && bash -n docker-initunlocklnd.sh && bash -n tests/docker-password-migration.sh

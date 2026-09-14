@@ -82,7 +82,11 @@ class MigrationTests(unittest.TestCase):
 
                 replacement = base64.b64decode(body["new_password"]).decode()
                 saved = fixture.read_unlock()
-                fixture.durable_requests.append(saved.get("wallet_password_pending") == replacement)
+                fixture.durable_requests.append(
+                    saved.get("wallet_password_pending") == replacement
+                    and replacement in saved.get("wallet_password_history", [])
+                    and supplied in saved.get("wallet_password_history", [])
+                )
                 if fixture.mode == "reject":
                     self.reply({"code": 2, "message": "database unavailable"}, 500)
                     return
@@ -137,6 +141,9 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(saved["cipher_seed_mnemonic"], self.original["cipher_seed_mnemonic"])
         self.assertEqual(saved["unrelated"], self.original["unrelated"])
         self.assertTrue(all(self.durable_requests))
+        self.assertIn(self.password, saved["wallet_password_history"])
+        self.assertIn("hellorockstar", saved["wallet_password_history"])
+        self.assertIn("hellorockstar\n", saved["wallet_password_history"])
 
     def test_migration_and_next_restart(self):
         result = self.run_helper()
@@ -181,7 +188,7 @@ class MigrationTests(unittest.TestCase):
         self.mode, self.locked = "success", True
         result = self.run_helper()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.calls[-1][0], "/v1/unlockwallet")
+        self.assertEqual(self.calls[-1][0], "/v1/changepassword")
         self.assert_completed()
 
     def test_lost_success_response_recovers_on_restart(self):
@@ -248,11 +255,19 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_completed()
 
-    def test_completed_migration_requests_deferred_rotation(self):
-        result = self.run_helper({"LND_MACAROON_ROTATION_ID": "test-rotation"})
+    def test_rotation_marker_only_after_success(self):
+        env = {"LND_MACAROON_ROTATION_ID": "test-rotation", "LND_PASSWORD_ROTATE_MACAROONS": "true"}
+        self.mode = "reject"
+        result = self.run_helper(env)
         self.assertNotEqual(result.returncode, 0)
+        marker = self.data / ".macaroon-rotated-test-rotation"
+        self.assertFalse(marker.exists())
+        self.mode = "success"
+        result = self.run_helper(env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_completed()
-        self.assertIn("Restart the LND container", result.stdout)
+        self.assertTrue(marker.exists())
+        self.assertTrue(self.calls[-1][1]["new_macaroon_root_key"])
 
     def test_already_unlocked_does_not_discard_pending_password(self):
         saved = self.original | {"wallet_password_pending": "uncertain-saved-password"}
@@ -260,7 +275,22 @@ class MigrationTests(unittest.TestCase):
         self.locked = False
         result = self.run_helper()
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.read_unlock(), saved)
+        for key, value in saved.items():
+            self.assertEqual(self.read_unlock()[key], value)
+
+    def test_custom_newline_unlock_does_not_change_password(self):
+        self.password = "custom with spaces\n"
+        self.write_unlock(self.original | {"wallet_password": "custom with spaces"})
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(all(path.endswith("unlockwallet") for path, _ in self.calls))
+        self.assertEqual(self.password, "custom with spaces\n")
+
+    def test_history_is_retained_on_another_migration(self):
+        self.write_unlock(self.original | {"wallet_password_history": ["previous-private-password"]})
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous-private-password", self.read_unlock()["wallet_password_history"])
 
     def test_prepare_preserves_auth_files_and_never_moves_wallet_data(self):
         saved = self.original | {"wallet_password_pending": "uncertain-saved-password"}
