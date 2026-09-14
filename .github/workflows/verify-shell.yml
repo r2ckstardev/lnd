@@ -1,0 +1,16 @@
+name: Shell startup verification
+on:
+  push:
+    branches: [verification/shell-startup]
+permissions:
+  contents: read
+jobs:
+  startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Shell syntax
+        run: bash -n docker-entrypoint.sh docker-initunlocklnd.sh tests/docker-startup.sh
+      - name: Released LND integration
+        run: bash tests/docker-startup.sh
