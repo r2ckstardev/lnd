@@ -1,0 +1,32 @@
+name: Native macaroon rotation verification
+on:
+  push:
+    branches: [verification/pr17-native-rotation]
+permissions:
+  contents: read
+jobs:
+  startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: passwords
+            scenarios: legacy empty null omitted custom custom-spaces
+          - group: pending
+            scenarios: pending-before pending-after rotation-pending rotation-pending-after fresh
+          - group: failures
+            scenarios: missing-readonly rotation-missing-readonly rotation-missing-store split-store unknown invalid-json newline
+          - group: channels-and-rotation
+            scenarios: password-only rotation rotation-custom
+    steps:
+      - uses: actions/checkout@v5
+      - name: Record sources and check shell syntax
+        run: |
+          git hash-object docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh
+          bash -n docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh
+      - name: Released LND integration
+        env:
+          TEST_SCENARIOS: ${{ matrix.scenarios }}
+        run: bash docker-startup-tests.sh
