@@ -1,0 +1,53 @@
+name: Manual startup verification
+on:
+  push:
+    branches: [verification/pr17-manual]
+permissions:
+  contents: read
+jobs:
+  startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: passwords
+            scenarios: legacy newline stored-newline empty null omitted custom custom-newline custom-stored-newline
+          - group: recovery
+            scenarios: pending-before pending-after split-store unknown invalid-json fresh interrupted-init
+          - group: reset
+            scenarios: missing-store-old missing-store-new missing-readonly
+          - group: rotation
+            scenarios: rotation-newline rotation-custom rotation-custom-newline rotation-pending rotation-split-store
+          - group: channel
+            scenarios: password-only rotation
+    steps:
+      - uses: actions/checkout@v5
+      - name: Shell syntax
+        run: bash -n docker-entrypoint.sh && bash -n docker-initunlocklnd.sh && bash -n docker-startup-tests.sh
+      - name: Released LND integration
+        env:
+          TEST_SCENARIOS: ${{ matrix.scenarios }}
+        run: bash docker-startup-tests.sh
+  original-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Confirm original newline-password failure
+        run: |
+          baseline=$(mktemp -d)
+          cp docker-startup-tests.sh "$baseline/"
+          for script in docker-entrypoint.sh docker-initunlocklnd.sh; do
+            git show d0b7990525cb73e75be8c80ec6ce51b6ff51732d:"$script" > "$baseline/$script"
+            chmod +x "$baseline/$script"
+          done
+          if TEST_SCENARIOS=newline bash "$baseline/docker-startup-tests.sh" > baseline.log 2>&1; then
+            echo 'Expected the original newline-password implementation to fail'; exit 1
+          fi
+          grep -q 'invalid passphrase for master public key' baseline.log
+          grep -q 'Timed out waiting for ready' baseline.log
+          echo 'PASS: reproduced original newline-password failure'

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+umask 077
 
 echo "[initunlocklnd] Waiting 2 seconds for lnd..."
 sleep 2
@@ -53,16 +54,22 @@ if [ -f "$WALLET_FILE" ]; then
         echo "[initunlocklnd] Wallet and Unlock files are present... parsing wallet password and unlocking lnd"
 
         # parse wallet password from unlock file
-        WALLETPASS=$(jq -c -r '.wallet_password' "$LNDUNLOCK_FILE")
-        # Nicolas deleted default password in some wallet unlock files, so we initializing default if password is empty
-        if [ "$WALLETPASS" == "" ] || [ "$WALLETPASS" == "null" ]; then
-            WALLETPASS="hellorockstar"
-        fi
-        # base64 of the stored password for the REST calls
-        WALLETPASS_BASE64=$(echo $WALLETPASS | tr -d '\n\r' | base64)
-        # a password change that was started but never confirmed leaves its new password here
+        chmod 600 "$LNDUNLOCK_FILE"
+        # Keep password bytes in base64: shell command substitution strips trailing
+        # newlines. Empty/missing passwords in old backups mean the shared default.
+        WALLETPASS_BASE64=$(jq -er 'if .wallet_password == null or .wallet_password == "" then "hellorockstar"
+            elif (.wallet_password | type) != "string" then error("wallet_password must be a string")
+            else .wallet_password end | @base64' "$LNDUNLOCK_FILE")
+        WALLETPASS_NEWLINE_BASE64=$({ printf %s "$WALLETPASS_BASE64" | base64 -d; printf '\n'; } | base64 | tr -d '\n')
+        # Retain the replacement even after success: older BTCPay versions can
+        # write a stale password back when removing the seed from walletunlock.json.
         NEWPASS_FILE="$LNDUNLOCK_FILE.newpassword"
-        NEWPASS=$(cat "$NEWPASS_FILE" 2>/dev/null || true)
+        NEWPASS=""
+        if [[ -e "$NEWPASS_FILE" ]]; then
+            chmod 600 "$NEWPASS_FILE"
+            NEWPASS=$(cat "$NEWPASS_FILE")
+            [[ ${#NEWPASS} -ge 8 ]] || { echo "[initunlocklnd] Invalid saved replacement password" >&2; exit 1; }
+        fi
         NEWPASS_BASE64=""
         if [[ "$NEWPASS" ]]; then NEWPASS_BASE64=$(printf %s "$NEWPASS" | base64 | tr -d '\n'); fi
 
@@ -74,7 +81,12 @@ if [ -f "$WALLET_FILE" ]; then
         wrong_password() { [[ "$1" == *"invalid passphrase for master public key"* ]]; }
         # write the confirmed working password into walletunlock.json
         save_password() {
-            jq -c --arg pw "$1" '.wallet_password = $pw' "$LNDUNLOCK_FILE" > "$LNDUNLOCK_FILE.tmp" && mv "$LNDUNLOCK_FILE.tmp" "$LNDUNLOCK_FILE"
+            local TEMP
+            TEMP=$(mktemp "$LNDUNLOCK_FILE.XXXXXX")
+            jq -c --arg pw "$1" '.wallet_password = ($pw | @base64d)' "$LNDUNLOCK_FILE" > "$TEMP"
+            sync "$TEMP"
+            mv "$TEMP" "$LNDUNLOCK_FILE"
+            sync "$LND_WALLET_DIR"
         }
 
         if [[ "${LND_MACAROONS_RESET:-false}" == true ]]; then
@@ -82,39 +94,43 @@ if [ -f "$WALLET_FILE" ]; then
             #    its tokens. changepassword needs that store, so a legacy password is
             #    changed on the next start instead. The unconfirmed new password, if
             #    any, goes first because lnd may already have it.
-            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$(printf %s hellorockstar | base64)"; do
+            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$WALLETPASS_NEWLINE_BASE64" "aGVsbG9yb2Nrc3Rhcg==" "aGVsbG9yb2Nrc3Rhcgo="; do
                 [[ "$CANDIDATE" ]] || continue
                 response=$(post unlockwallet '{ "wallet_password":"'$CANDIDATE'" }')
                 if [[ "$response" == "{}" ]]; then break; fi
                 wrong_password "$response" || break
             done
             if [[ "$response" == "{}" ]]; then
-                # keep the password that actually worked; the unconfirmed one is moot now
-                save_password "$(printf %s "$CANDIDATE" | base64 -d)"
-                rm -f "$NEWPASS_FILE"
+                # Keep the password that worked and any unapplied replacement.
+                save_password "$CANDIDATE"
                 echo "[initunlocklnd] Wallet unlocked after the macaroon reset; a legacy password is changed on the next start"
             else
                 echo "[initunlocklnd] Wallet unlocking failed, lnd returned: $response"
                 exit 1
             fi
-        elif [[ "$NEWPASS" || "$WALLETPASS" == "hellorockstar" ]]; then
+        elif [[ ( "$NEWPASS_BASE64" && "$NEWPASS_BASE64" != "$WALLETPASS_BASE64" ) ||
+                "$WALLETPASS_BASE64" == "aGVsbG9yb2Nrc3Rhcg==" || "$WALLETPASS_BASE64" == "aGVsbG9yb2Nrc3Rhcgo=" ]]; then
             # 2. Legacy shared default password (or an unconfirmed change): move to a
             #    random one. lnd re-encrypts wallet.db BEFORE it touches macaroons.db, so
             #    the new password is saved to a file first and only moved into
             #    walletunlock.json once lnd confirms the change.
             if [[ -z "$NEWPASS" ]]; then
                 NEWPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-                printf '%s\n' "$NEWPASS" > "$NEWPASS_FILE"
+                NEWPASS_TMP=$(mktemp "$NEWPASS_FILE.XXXXXX")
+                printf '%s\n' "$NEWPASS" > "$NEWPASS_TMP"
+                sync "$NEWPASS_TMP"
+                mv "$NEWPASS_TMP" "$NEWPASS_FILE"
+                sync "$LND_WALLET_DIR"
                 NEWPASS_BASE64=$(printf %s "$NEWPASS" | base64 | tr -d '\n')
             fi
             # a successful changepassword returns {} (macaroons disabled) or {"admin_macaroon":"..."}
-            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64"; do
+            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$WALLETPASS_NEWLINE_BASE64"; do
                 response=$(post changepassword '{ "current_password":"'$CANDIDATE'", "new_password":"'$NEWPASS_BASE64'" }')
                 if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then break; fi
                 wrong_password "$response" || break
             done
             if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then
-                save_password "$NEWPASS" && rm -f "$NEWPASS_FILE"
+                save_password "$NEWPASS_BASE64"
                 echo "[initunlocklnd] Migrated wallet off the default password; the new random password is in $LNDUNLOCK_FILE"
             else
                 echo "[initunlocklnd] WARNING: password change failed, lnd returned: $response"
@@ -124,8 +140,13 @@ if [ -f "$WALLET_FILE" ]; then
             fi
         else
             # 3. Normal start: unlock with the saved random password.
-            response=$(post unlockwallet '{ "wallet_password":"'$WALLETPASS_BASE64'" }')
+            for CANDIDATE in "$WALLETPASS_BASE64" "$WALLETPASS_NEWLINE_BASE64"; do
+                response=$(post unlockwallet '{ "wallet_password":"'$CANDIDATE'" }')
+                if [[ "$response" == "{}" ]]; then break; fi
+                wrong_password "$response" || break
+            done
             if [[ "$response" == "{}" ]]; then
+                save_password "$CANDIDATE"
                 echo "[initunlocklnd] Wallet unlocked"
             else
                 echo "[initunlocklnd] Wallet unlocking failed, lnd returned: $response"
@@ -135,28 +156,31 @@ if [ -f "$WALLET_FILE" ]; then
 
     fi
 else
-    echo "[initunlocklnd] Wallet file doesn't exist. Initializing LND instance with new autogenerated password and seed"
+    echo "[initunlocklnd] Wallet file doesn't exist. Initializing LND instance"
 
-    # generate seed mnemonic
-    GENSEED_RESP=$(curl -s --cacert "$CA_CERT" -X GET -H $MACAROON_HEADER $LND_REST_LISTEN_HOST/v1/genseed)
-    CIPHER_ARRAY_EXTRACTED=$(echo $GENSEED_RESP | jq -c -r '.cipher_seed_mnemonic')
-
-    # random per-instance password, stored in cleartext in the unlock file next
-    # to wallet.db (the file that BTCPay's seed backup view exposes)
-    WALLETPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-
-    # save all the the data to unlock file we'll use for future unlocks
-    RESULTJSON='{"wallet_password":"'$WALLETPASS'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
-    mkdir -p $LND_WALLET_DIR
-    echo $RESULTJSON > $LNDUNLOCK_FILE
-
-    # previous versions will have a default wallet password including a line feed at the end "hellorockstar\n"
-    # line feed hex code 0x0A.
-    WALLETPASS_BASE64=$(echo $WALLETPASS | tr -d '\n\r' | base64)
-    INITWALLET_REQ='{"wallet_password":"'$WALLETPASS_BASE64'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
-
-    # execute initwallet call
-    curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" $LND_REST_LISTEN_HOST/v1/initwallet
+    # Reuse a saved request if initialization was interrupted; never replace its seed.
+    mkdir -p "$LND_WALLET_DIR"
+    if [ ! -f "$LNDUNLOCK_FILE" ]; then
+        GENSEED_RESP=$(curl -sS --cacert "$CA_CERT" -H "$MACAROON_HEADER" "$LND_REST_LISTEN_HOST/v1/genseed")
+        WALLETPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+        INIT_TMP=$(mktemp "$LNDUNLOCK_FILE.XXXXXX")
+        printf %s "$GENSEED_RESP" | jq -ec --arg pw "$WALLETPASS" '
+            select(.cipher_seed_mnemonic | type == "array" and length == 24) |
+            {wallet_password:$pw, cipher_seed_mnemonic}' > "$INIT_TMP"
+        sync "$INIT_TMP"
+        mv "$INIT_TMP" "$LNDUNLOCK_FILE"
+        sync "$LND_WALLET_DIR"
+    fi
+    chmod 600 "$LNDUNLOCK_FILE"
+    INITWALLET_REQ=$(jq -ec 'select((.wallet_password | type == "string" and length >= 8) and
+        (.cipher_seed_mnemonic | type == "array" and length == 24)) |
+        {wallet_password:(.wallet_password | @base64), cipher_seed_mnemonic}' "$LNDUNLOCK_FILE")
+    response=$(curl -sS --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" "$LND_REST_LISTEN_HOST/v1/initwallet")
+    if [[ "$response" != "{}" && "$response" != *'"admin_macaroon"'* ]]; then
+        echo "[initunlocklnd] Wallet initialization failed, lnd returned: $response"
+        exit 1
+    fi
+    echo "[initunlocklnd] Wallet initialized"
 fi
 
 # LND unlocked, now run Loop

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
+if [[ "$1" == "lnd" ]]; then
 	mkdir -p "$LND_DATA"
 
     # removing noseedbackup=1 flag, adding it below if needed for legacy
