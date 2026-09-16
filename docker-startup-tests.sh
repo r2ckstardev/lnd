@@ -99,7 +99,7 @@ adminmacaroonpath=/data/admin.macaroon
 readonlymacaroonpath=/data/readonly.macaroon
 invoicemacaroonpath=/data/invoice.macaroon'
 
-for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom custom-spaces pending-before pending-after rotation rotation-custom rotation-pending rotation-pending-after rotation-missing-readonly rotation-missing-store missing-readonly split-store unknown invalid-json newline stored-newline rotation-newline rotation-stored-newline fresh}; do
+for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom custom-spaces pending-before pending-after rotation rotation-custom rotation-custom-spaces rotation-pending rotation-pending-after rotation-missing-readonly rotation-missing-store missing-readonly split-store unknown invalid-json newline stored-newline rotation-newline rotation-stored-newline fresh}; do
     echo "Testing $SCENARIO"
     ROTATION=
     ROTATE_EXPECTED=false
@@ -108,11 +108,10 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
         newline|rotation-newline) ACTUAL=$'hellorockstar\n' ;;
         stored-newline|rotation-stored-newline) ACTUAL=$'hellorockstar\n'; STORED=$ACTUAL ;;
         custom|rotation-custom) ACTUAL=existing-custom-password; STORED=$ACTUAL ;;
-        custom-spaces) ACTUAL='custom password with * spaces'; STORED=$ACTUAL ;;
+        custom-spaces|rotation-custom-spaces) ACTUAL='custom password with * spaces'; STORED=$ACTUAL ;;
         unknown) ACTUAL=unsaved-wallet-password ;;
     esac
     case "$SCENARIO" in
-        rotation-pending*) ROTATION=test ;; # Finish the password change on this start.
         rotation*) ROTATION=test; ROTATE_EXPECTED=true ;;
     esac
     docker volume create "$VOLUME" >/dev/null
@@ -206,10 +205,13 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             docker exec "$LND" test ! -e /data/.macaroon-rotated-test
             if [[ "$SCENARIO" == unknown ]]; then
                 docker logs "$LND" 2>&1 | grep -q 'invalid passphrase for master public key'
+            fi
+            if [[ "$SCENARIO" == unknown || "$SCENARIO" == rotation-missing-* ]]; then
                 replacement | grep -Eq '^[A-Za-z0-9+/]{43}=$'
             elif [[ "$SCENARIO" == split-store ]]; then
                 [[ $(replacement) == saved-before-request ]]
-            elif [[ "$SCENARIO" == rotation-missing-readonly ]]; then
+            fi
+            if [[ "$SCENARIO" == rotation-missing-readonly ]]; then
                 docker logs "$LND" 2>&1 | grep -q 'could not remove macaroon file'
             fi
             [[ $(curl -sf "$URL/v1/state" | jq -r .state) == LOCKED ]]
@@ -223,21 +225,18 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             FINAL=$(saved | jq -r '.wallet_password | @base64')
             if [[ "$ROTATE_EXPECTED" == true ]]; then
                 docker exec "$LND" test -f /data/.macaroon-rotated-test
-                [[ "$FINAL" == $(printf %s "$STORED" | base64 | tr -d '\n') ]]
-                ! docker logs "$LND" 2>&1 | grep -q 'Wallet password changed'
-            elif [[ "$SCENARIO" == *pending* ]]; then
+            fi
+            if [[ "$SCENARIO" == *pending* ]]; then
                 saved | jq -e '.wallet_password == "saved-before-request"' >/dev/null
-                docker exec "$LND" test ! -e /data/.macaroon-rotated-test
-            elif [[ "$SCENARIO" != custom* ]]; then
+            elif [[ "$SCENARIO" == *custom* ]]; then
+                [[ "$FINAL" == $(printf %s "$ACTUAL" | base64 | tr -d '\n') ]]
+            else
                 saved | jq -e '.wallet_password | length == 44' >/dev/null
             fi
             if [[ "$SCENARIO" != fresh ]]; then
                 [[ $(auth getinfo | jq -r .identity_pubkey) == "$IDENTITY" ]]
                 saved | jq -e '.unrelated.keep' >/dev/null
                 [[ $(saved | jq -c .cipher_seed_mnemonic) == "$(jq -c .cipher_seed_mnemonic <<< "$SEED")" ]]
-                if [[ "$SCENARIO" == custom* ]]; then
-                    [[ "$FINAL" == $(printf %s "$ACTUAL" | base64 | tr -d '\n') ]]
-                fi
             fi
             if [[ "$SCENARIO" != fresh ]]; then
                 for TOKEN in "$OLD_MACAROON" "$CUSTOM_MACAROON"; do
@@ -259,27 +258,9 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             upgrade
             wait_for ready
             [[ $(count) == 2 ]]
-            # Rotation can precede migration, or follow an unfinished password change.
+            # Both operations finish on the first start; the next start preserves credentials.
             SECOND=$(saved | jq -r '.wallet_password | @base64')
-            if [[ "$ROTATE_EXPECTED" == true && ( "$ACTUAL" == hellorockstar || "$ACTUAL" == $'hellorockstar\n' ) ]]; then
-                [[ "$SECOND" != "$FINAL" ]]
-                saved | jq -e '.wallet_password | length == 44' >/dev/null
-            else
-                [[ "$SECOND" == "$FINAL" ]]
-            fi
-            if [[ "$SCENARIO" == rotation-pending* ]]; then
-                docker exec "$LND" test -f /data/.macaroon-rotated-test
-                token_revoked "$BEFORE_MACAROON"
-                token_revoked "$CUSTOM_MACAROON"
-                # A third start must honor the marker rather than rotate again.
-                BEFORE_MACAROON=$(docker exec "$LND" xxd -p -c 10000 /data/admin.macaroon)
-                docker stop "$LND" >/dev/null
-                docker rm "$LND" >/dev/null
-                upgrade
-                wait_for ready
-                [[ $(count) == 3 ]]
-                [[ $(saved | jq -r '.wallet_password | @base64') == "$SECOND" ]]
-            fi
+            [[ "$SECOND" == "$FINAL" ]]
             token_valid "$BEFORE_MACAROON" ;;
     esac
     [[ $(docker inspect "$LND" | jq -r '.[0].HostConfig.RestartPolicy.Name') == no ]]

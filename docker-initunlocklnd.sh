@@ -66,8 +66,7 @@ if [ -f "$WALLET_FILE" ]; then
         NEWPASS=$(cat "$NEWPASS_FILE" 2>/dev/null || true)
         ROTATION_MARKER="$LND_DATA/.macaroon-rotated-${LND_MACAROON_ROTATION_ID}"
         ROTATE=false
-        # Finish an unconfirmed password change before attempting rotation.
-        if [[ "$LND_MACAROON_ROTATION_ID" && ! -f "$ROTATION_MARKER" && -z "$NEWPASS" ]]; then
+        if [[ "$LND_MACAROON_ROTATION_ID" && ! -f "$ROTATION_MARKER" ]]; then
             ROTATE=true
         fi
 
@@ -83,32 +82,30 @@ if [ -f "$WALLET_FILE" ]; then
         }
 
         if [[ "$ROTATE" == true || "$NEWPASS" || "$WALLETPASS" == "hellorockstar" ]]; then
-            if [[ "$ROTATE" == true ]]; then
-                # Rotate roots with the same password; migrate a default password on a later start.
-                NEWPASS="$WALLETPASS"
-            elif [[ -z "$NEWPASS" ]]; then
+            if [[ -z "$NEWPASS" && "$WALLETPASS" == hellorockstar ]]; then
                 # Save first: lnd changes wallet.db before updating macaroons.db.
                 NEWPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
                 printf '%s\n' "$NEWPASS" > "$NEWPASS_FILE"
             fi
-            NEWPASS_BASE64=$(printf %s "$NEWPASS" | base64 | tr -d '\n')
+            # Keep custom passwords; combine a pending/default password change with rotation.
+            NEWPASS_BASE64=$(printf %s "${NEWPASS:-$WALLETPASS}" | base64 | tr -d '\n')
             # Both operations unlock on success. Only a wrong wallet password permits another try.
             # The last candidate handles historical hellorockstar\n passwords.
             for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$([[ "$WALLETPASS" == hellorockstar ]] && printf 'hellorockstar\n' | base64)"; do
                 [[ "$CANDIDATE" ]] || continue
-                if [[ "$ROTATE" == true ]]; then NEWPASS_BASE64="$CANDIDATE"; fi
                 response=$(post changepassword '{ "current_password":"'$CANDIDATE'", "new_password":"'$NEWPASS_BASE64'", "new_macaroon_root_key":'$ROTATE' }')
                 if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then break; fi
                 wrong_password "$response" || break
             done
             if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then
-                if [[ "$ROTATE" == true ]]; then
-                    touch "$ROTATION_MARKER"
-                    echo "[initunlocklnd] Macaroons rotated; wallet unlocked with the same password. Re-pair clients and reissue custom macaroons."
-                else
+                if [[ "$NEWPASS" ]]; then
                     save_password "$NEWPASS"
                     rm -f "$NEWPASS_FILE"
                     echo "[initunlocklnd] Wallet password changed and wallet unlocked; saved in $LNDUNLOCK_FILE"
+                fi
+                if [[ "$ROTATE" == true ]]; then
+                    touch "$ROTATION_MARKER"
+                    echo "[initunlocklnd] Macaroons rotated; wallet unlocked. Re-pair clients and reissue custom macaroons."
                 fi
             else
                 echo "[initunlocklnd] Password change or macaroon rotation failed: $response"

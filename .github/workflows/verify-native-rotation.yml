@@ -21,7 +21,7 @@ jobs:
           - group: failures
             scenarios: missing-readonly rotation-missing-readonly rotation-missing-store split-store unknown invalid-json
           - group: channels-and-rotation
-            scenarios: password-only rotation rotation-custom
+            scenarios: password-only rotation rotation-custom rotation-custom-spaces
     steps:
       - uses: actions/checkout@v5
       - name: Record sources and check shell syntax
