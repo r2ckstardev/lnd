@@ -13,7 +13,7 @@ jobs:
       matrix:
         include:
           - group: passwords
-            scenarios: legacy newline stored-newline empty null omitted custom custom-newline custom-stored-newline
+            scenarios: legacy newline stored-newline empty null omitted custom custom-newline custom-stored-newline custom-long
           - group: recovery
             scenarios: pending-before pending-after split-store unknown invalid-json fresh interrupted-init
           - group: reset

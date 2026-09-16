@@ -61,6 +61,8 @@ if [ -f "$WALLET_FILE" ]; then
             elif (.wallet_password | type) != "string" then error("wallet_password must be a string")
             else .wallet_password end | @base64' "$LNDUNLOCK_FILE")
         WALLETPASS_NEWLINE_BASE64=$({ printf %s "$WALLETPASS_BASE64" | base64 -d; printf '\n'; } | base64 | tr -d '\n')
+        DEFAULT_BASE64=$(printf %s hellorockstar | base64)
+        DEFAULT_NEWLINE_BASE64=$(printf 'hellorockstar\n' | base64)
         # Retain the replacement even after success: older BTCPay versions can
         # write a stale password back when removing the seed from walletunlock.json.
         NEWPASS_FILE="$LNDUNLOCK_FILE.newpassword"
@@ -94,9 +96,9 @@ if [ -f "$WALLET_FILE" ]; then
             #    its tokens. changepassword needs that store, so a legacy password is
             #    changed on the next start instead. The unconfirmed new password, if
             #    any, goes first because lnd may already have it.
-            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$WALLETPASS_NEWLINE_BASE64" "aGVsbG9yb2Nrc3Rhcg==" "aGVsbG9yb2Nrc3Rhcgo="; do
+            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$WALLETPASS_NEWLINE_BASE64" "$DEFAULT_BASE64" "$DEFAULT_NEWLINE_BASE64"; do
                 [[ "$CANDIDATE" ]] || continue
-                response=$(post unlockwallet '{ "wallet_password":"'$CANDIDATE'" }')
+                response=$(post unlockwallet "{\"wallet_password\":\"$CANDIDATE\"}")
                 if [[ "$response" == "{}" ]]; then break; fi
                 wrong_password "$response" || break
             done
@@ -109,7 +111,7 @@ if [ -f "$WALLET_FILE" ]; then
                 exit 1
             fi
         elif [[ ( "$NEWPASS_BASE64" && "$NEWPASS_BASE64" != "$WALLETPASS_BASE64" ) ||
-                "$WALLETPASS_BASE64" == "aGVsbG9yb2Nrc3Rhcg==" || "$WALLETPASS_BASE64" == "aGVsbG9yb2Nrc3Rhcgo=" ]]; then
+                "$WALLETPASS_BASE64" == "$DEFAULT_BASE64" || "$WALLETPASS_BASE64" == "$DEFAULT_NEWLINE_BASE64" ]]; then
             # 2. Legacy shared default password (or an unconfirmed change): move to a
             #    random one. lnd re-encrypts wallet.db BEFORE it touches macaroons.db, so
             #    the new password is saved to a file first and only moved into
@@ -125,7 +127,7 @@ if [ -f "$WALLET_FILE" ]; then
             fi
             # a successful changepassword returns {} (macaroons disabled) or {"admin_macaroon":"..."}
             for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$WALLETPASS_NEWLINE_BASE64"; do
-                response=$(post changepassword '{ "current_password":"'$CANDIDATE'", "new_password":"'$NEWPASS_BASE64'" }')
+                response=$(post changepassword "{\"current_password\":\"$CANDIDATE\",\"new_password\":\"$NEWPASS_BASE64\"}")
                 if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then break; fi
                 wrong_password "$response" || break
             done
@@ -141,7 +143,7 @@ if [ -f "$WALLET_FILE" ]; then
         else
             # 3. Normal start: unlock with the saved random password.
             for CANDIDATE in "$WALLETPASS_BASE64" "$WALLETPASS_NEWLINE_BASE64"; do
-                response=$(post unlockwallet '{ "wallet_password":"'$CANDIDATE'" }')
+                response=$(post unlockwallet "{\"wallet_password\":\"$CANDIDATE\"}")
                 if [[ "$response" == "{}" ]]; then break; fi
                 wrong_password "$response" || break
             done
