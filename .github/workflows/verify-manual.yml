@@ -51,3 +51,58 @@ jobs:
           grep -q 'invalid passphrase for master public key' baseline.log
           grep -q 'Timed out waiting for ready' baseline.log
           echo 'PASS: reproduced original newline-password failure'
+  no-macaroons-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the review claim against released LND
+        run: |
+          docker run --rm --entrypoint bash btcpayserver/lnd:v0.21.3-beta-1 -c '
+            set -e
+            /bin/lnd --lnddir=/data --bitcoin.active --bitcoin.regtest --bitcoin.node=bitcoind \
+              --bitcoind.rpchost=127.0.0.1:18443 --bitcoind.rpcuser=test --bitcoind.rpcpass=test \
+              --bitcoind.zmqpubrawblock=tcp://127.0.0.1:28332 --bitcoind.zmqpubrawtx=tcp://127.0.0.1:28333 \
+              --no-macaroons --no-rest-tls --restlisten=127.0.0.1:8080 > /tmp/lnd.log 2>&1 &
+            pid=$!
+            trap "kill $pid || true" EXIT
+            for ((i=0; i<30; i++)); do
+              if curl -sf http://127.0.0.1:8080/v1/state | jq -e '\'' .state == "NON_EXISTING" '\''; then break; fi
+              sleep 1
+            done
+            test -s /data/data/chain/bitcoin/regtest/macaroons.db || { cat /tmp/lnd.log; exit 1; }
+            echo "PASS: no-macaroons still creates a nonempty macaroons.db before unlock"
+          '
+  architecture-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+          - platform: linux/arm64
+            suffix: arm64v8
+          - platform: linux/arm/v7
+            suffix: arm32v7
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - name: Check shell and filesystem primitives
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          docker run --rm --platform "$PLATFORM" -v "$PWD:/source:ro" \
+            --entrypoint bash "btcpayserver/lnd:v0.21.3-beta-1-$SUFFIX" -c '
+              set -e
+              bash -n /source/docker-entrypoint.sh
+              bash -n /source/docker-initunlocklnd.sh
+              bash -n /source/docker-startup-tests.sh
+              umask 077
+              temp=$(mktemp /data/credential.XXXXXX)
+              printf value > "$temp"
+              test "$(stat -c %a "$temp")" = 600
+              sync "$temp" /data
+              find /data -name "credential.*" -exec rm -f {} +
+              test ! -e "$temp"
+            '
