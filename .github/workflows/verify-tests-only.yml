@@ -1,0 +1,46 @@
+name: Original startup test compatibility
+on:
+  push:
+    branches: [verification/pr17-tests-only]
+permissions:
+  contents: read
+jobs:
+  startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: passwords
+            scenarios: legacy empty null omitted custom
+          - group: pending-and-errors
+            scenarios: pending-before pending-after split-store unknown invalid-json fresh
+          - group: reset
+            scenarios: missing-store-old missing-store-new missing-readonly rotation-pending rotation-split-store rotation-custom
+          - group: channels
+            scenarios: password-only rotation
+    steps:
+      - uses: actions/checkout@v5
+      - name: Confirm original runtime scripts and shell syntax
+        run: |
+          test "$(git hash-object docker-entrypoint.sh)" = 760c4f87db091d76182350829a2bdca79921b98e
+          test "$(git hash-object docker-initunlocklnd.sh)" = 396532d874a654fa547fcd0c601512a9e6e244c2
+          bash -n docker-startup-tests.sh
+      - name: Released LND integration
+        env:
+          TEST_SCENARIOS: ${{ matrix.scenarios }}
+        run: bash docker-startup-tests.sh
+  newline-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v5
+      - name: Record the deferred trailing-newline regression
+        run: |
+          if TEST_SCENARIOS=newline bash docker-startup-tests.sh > newline.log 2>&1; then
+            echo 'Unexpected pass: review the recorded newline behavior'; exit 1
+          fi
+          grep -q 'invalid passphrase for master public key' newline.log
+          grep -q 'Timed out waiting for ready' newline.log
+          echo 'CONFIRMED KNOWN FAILURE: historical newline password does not unlock'
