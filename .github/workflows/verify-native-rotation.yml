@@ -14,10 +14,12 @@ jobs:
         include:
           - group: passwords
             scenarios: legacy empty null omitted custom custom-spaces
+          - group: historical-default
+            scenarios: newline stored-newline rotation-newline rotation-stored-newline
           - group: pending
             scenarios: pending-before pending-after rotation-pending rotation-pending-after fresh
           - group: failures
-            scenarios: missing-readonly rotation-missing-readonly rotation-missing-store split-store unknown invalid-json newline
+            scenarios: missing-readonly rotation-missing-readonly rotation-missing-store split-store unknown invalid-json
           - group: channels-and-rotation
             scenarios: password-only rotation rotation-custom
     steps:
@@ -25,7 +27,7 @@ jobs:
       - name: Record sources and check shell syntax
         run: |
           git hash-object docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh
-          bash -n docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh
+          for script in docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh; do bash -n "$script"; done
       - name: Released LND integration
         env:
           TEST_SCENARIOS: ${{ matrix.scenarios }}

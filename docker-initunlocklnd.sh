@@ -83,7 +83,6 @@ if [ -f "$WALLET_FILE" ]; then
         }
 
         if [[ "$ROTATE" == true || "$NEWPASS" || "$WALLETPASS" == "hellorockstar" ]]; then
-            # Historical hellorockstar\n passwords are unsupported; the wallet stays locked.
             if [[ "$ROTATE" == true ]]; then
                 # Rotate roots with the same password; migrate a default password on a later start.
                 NEWPASS="$WALLETPASS"
@@ -94,7 +93,10 @@ if [ -f "$WALLET_FILE" ]; then
             fi
             NEWPASS_BASE64=$(printf %s "$NEWPASS" | base64 | tr -d '\n')
             # Both operations unlock on success. Only a wrong wallet password permits another try.
-            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64"; do
+            # The last candidate handles historical hellorockstar\n passwords.
+            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$([[ "$WALLETPASS" == hellorockstar ]] && printf 'hellorockstar\n' | base64)"; do
+                [[ "$CANDIDATE" ]] || continue
+                if [[ "$ROTATE" == true ]]; then NEWPASS_BASE64="$CANDIDATE"; fi
                 response=$(post changepassword '{ "current_password":"'$CANDIDATE'", "new_password":"'$NEWPASS_BASE64'", "new_macaroon_root_key":'$ROTATE' }')
                 if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then break; fi
                 wrong_password "$response" || break
