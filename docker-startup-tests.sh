@@ -38,6 +38,7 @@ auth() {
 }
 funded() { auth balance/blockchain | jq -e '.confirmed_balance | tonumber >= 100000000'; }
 channel_open() { auth channels | jq -e '.channels | length == 1'; }
+peer_connected() { auth peers | jq -e --arg key "$PEER_KEY" 'any(.peers[]; .pub_key == $key)'; }
 channels() { auth channels | jq -Sc '[.channels[] | {channel_point,remote_pubkey,capacity,local_balance,remote_balance}]'; }
 peer_info() {
     curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$(docker exec "$PEER" xxd -p -c 10000 /data/admin.macaroon)" "$PEER_URL/v1/getinfo"
@@ -143,7 +144,8 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             echo "Connecting disposable channel peer"
             jq -nc --arg key "$PEER_KEY" '{addr:{pubkey:$key,host:"peer:9735"},perm:true}' |
                 curl -sf --max-time 60 -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/peers" >/dev/null
-            jq -nc --arg key "$PEER_KEY" '{node_pubkey_string:$key,local_funding_amount:"1000000",private:true}' |
+            wait_for peer_connected
+            jq -nc --arg key "$PEER_KEY" '{node_pubkey_string:$key,local_funding_amount:"1000000",private:true,sat_per_vbyte:"2"}' |
                 curl -sf --max-time 60 -H "Grpc-Metadata-macaroon:$OLD_MACAROON" --data-binary @- "$URL/v1/channels" >/dev/null
             echo "Confirming disposable channel"
             bitcoin generatetoaddress 6 "$(bitcoin getnewaddress)" >/dev/null
