@@ -17,7 +17,7 @@ jobs:
           - group: recovery
             scenarios: pending-before pending-after split-store unknown invalid-json fresh interrupted-init
           - group: reset
-            scenarios: missing-store-old missing-store-new missing-readonly
+            scenarios: missing-store-old missing-store-new missing-readonly interrupted-reset
           - group: rotation
             scenarios: rotation-newline rotation-custom rotation-custom-newline rotation-pending rotation-split-store
           - group: channel

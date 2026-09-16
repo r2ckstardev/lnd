@@ -105,11 +105,6 @@ if [[ "$1" == "lnd" ]]; then
         ROTATION_MARKER="$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
         if [ ! -f "$ROTATION_MARKER" ]; then
             echo "[lnd_unlock_entrypoint] Rotating macaroons ($LND_MACAROON_ROTATION_ID), ALL existing macaroons are being invalidated"
-            # -exec rm rather than -delete, busybox find on alpine may not have it
-            find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) \
-                -print -exec rm -f {} \;
-            touch "$ROTATION_MARKER"
-            echo "[lnd_unlock_entrypoint] Macaroons removed, lnd will regenerate them. Every client must be re-paired"
             # tells the unlocker not to change the password on this start: lnd must
             # recreate the store first, changepassword needs it in place
             export LND_MACAROONS_RESET=true
@@ -118,9 +113,19 @@ if [[ "$1" == "lnd" ]]; then
     # A missing or empty macaroons.db (a rotation that never finished) cannot take
     # a password change either: drop the dead token files and only unlock, so lnd
     # recreates everything.
-    if [[ -f "$WALLET_FILE" && ! -s "${WALLET_FILE/wallet.db/macaroons.db}" ]]; then
-        find "$LND_DATA" -type f -name '*.macaroon' -print -exec rm -f {} \;
+    if [[ -f "$LND_DATA/.macaroon-reset-pending" ||
+          ( -f "$WALLET_FILE" && ! -s "${WALLET_FILE/wallet.db/macaroons.db}" ) ]]; then
         export LND_MACAROONS_RESET=true
+    fi
+    if [[ "$LND_MACAROONS_RESET" == true ]]; then
+        # LND opens a nonempty store before unlock. Keep this marker until the
+        # unlocker confirms readiness, so interruption still means reset next time.
+        touch "$LND_DATA/.macaroon-reset-pending"
+        sync "$LND_DATA/.macaroon-reset-pending" "$LND_DATA"
+        # -exec ... + propagates a removal failure and works with BusyBox find.
+        find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) \
+            -print -exec rm -f {} +
+        echo "[lnd_unlock_entrypoint] Macaroons removed, lnd will regenerate them. Every client must be re-paired"
     fi
 
     # hit up the auto initializer and unlocker on separate process to do it's work

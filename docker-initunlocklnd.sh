@@ -185,6 +185,28 @@ else
     echo "[initunlocklnd] Wallet initialized"
 fi
 
+# A reset is complete only after the regenerated macaroon authenticates.
+if [[ "${LND_MACAROONS_RESET:-false}" == true ]]; then
+    for ((ATTEMPT=0; ATTEMPT<120; ATTEMPT++)); do
+        if [[ -s "$MACAROON_FILE" ]] && curl -sf --max-time 5 --cacert "$CA_CERT" \
+            -H "Grpc-Metadata-macaroon:$(xxd -p -c 10000 "$MACAROON_FILE")" "$LND_REST_LISTEN_HOST/v1/getinfo" > /dev/null; then
+            sync
+            if [[ "${LND_MACAROON_ROTATION_ID}" ]]; then
+                touch "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
+                sync "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID" "$LND_DATA"
+            fi
+            rm -f "$LND_DATA/.macaroon-reset-pending"
+            sync "$LND_DATA"
+            break
+        fi
+        sleep 2
+    done
+    if [[ -f "$LND_DATA/.macaroon-reset-pending" ]]; then
+        echo "[initunlocklnd] Macaroon reset is still pending; authenticated startup did not complete" >&2
+        exit 1
+    fi
+fi
+
 # LND unlocked, now run Loop
 
 if [ ! -z "$LND_HOST_FOR_LOOP" ]; then
