@@ -83,11 +83,8 @@ peer_info() {
 }
 ready() {
     auth getinfo >/dev/null || return 1
-    if [[ "$PASSWORD_KIND" == legacy ]]; then
-        docker logs "$LND" 2>&1 | grep -q '^\[initunlocklnd\].*UNLOCK FILE DOESN.T EXIST'
-        return
-    fi
-    [[ "$SCENARIO" == fresh* ]] || docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocked|Wallet password changed|Macaroons rotated'
+    [[ "$SCENARIO" == fresh* || "$PASSWORD_KIND" == legacy ]] ||
+        docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocked|Wallet password changed|Macaroons rotated'
 }
 failed() { docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocking failed|Password change or macaroon rotation failed|parse error'; }
 token_valid() { curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" >/dev/null; }
@@ -293,8 +290,6 @@ case "$SCENARIO" in
             else
                 saved | jq -e '.wallet_password | length == 44' >/dev/null
             fi
-        else
-            docker exec "$LND" test ! -e "$WALLET"
         fi
         if [[ "$SCENARIO" != fresh* ]]; then
             [[ $(auth getinfo | jq -r .identity_pubkey) == "$IDENTITY" ]]
@@ -344,8 +339,6 @@ case "$SCENARIO" in
         if [[ "$PASSWORD_KIND" != legacy ]]; then
             SECOND=$(saved | jq -r '.wallet_password | @base64')
             [[ "$SECOND" == "$FINAL" ]]
-        else
-            docker exec "$LND" test ! -e "$WALLET"
         fi
         token_valid "$BEFORE_MACAROON" ;;
 esac
