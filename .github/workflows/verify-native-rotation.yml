@@ -4,7 +4,37 @@ on:
     branches: [verification/pr17-native-rotation]
 permissions:
   contents: read
+env:
+  TEST_IMAGE: btcpayserver/lnd:v0.21.3-beta-2-test-del
 jobs:
+  image:
+    name: Published image (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # ARM publication is blocked by Debian package 404s in the tagged Dockerfiles.
+        platform: [linux/amd64]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify packaged scripts and binary versions
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker pull --platform "$PLATFORM" "$TEST_IMAGE"
+          WORK=$(mktemp -d)
+          NAME=btcpay-image-$$
+          trap 'docker rm -fv "$NAME" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+          docker create --name "$NAME" --platform "$PLATFORM" --entrypoint /bin/true "$TEST_IMAGE"
+          for script in docker-entrypoint.sh docker-initunlocklnd.sh; do
+            docker cp "$NAME:/$script" "$WORK/$script"
+            cmp "$script" "$WORK/$script"
+            sha256sum "$WORK/$script"
+          done
+          docker run --rm --platform "$PLATFORM" --entrypoint /bin/lnd "$TEST_IMAGE" --version
+          docker run --rm --platform "$PLATFORM" --entrypoint /bin/lncli "$TEST_IMAGE" --version
+          docker run --rm --platform "$PLATFORM" --entrypoint /bin/loop "$TEST_IMAGE" --version
   startup:
     runs-on: ubuntu-latest
     timeout-minutes: 12
@@ -32,7 +62,9 @@ jobs:
         run: |
           git hash-object docker-entrypoint.sh docker-initunlocklnd.sh btcpay/test-startup-tests.sh .github/workflows/btcpay-tests.yml
           for script in docker-entrypoint.sh docker-initunlocklnd.sh btcpay/test-startup-tests.sh; do bash -n "$script"; done
-      - name: Released LND integration
+      - name: Published test image integration
         env:
           TEST_SCENARIOS: ${{ matrix.scenarios }}
-        run: bash btcpay/test-startup-tests.sh
+        run: |
+          sed -i "s|^IMAGE=.*|IMAGE=$TEST_IMAGE|" btcpay/test-startup-tests.sh
+          bash btcpay/test-startup-tests.sh
