@@ -12,8 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - group: rotation-matrix
+            scenarios: matrix-legacy-none matrix-legacy-V1 matrix-legacy-V2 matrix-default-none matrix-default-V1 matrix-default-V2 matrix-custom-none matrix-custom-V1 matrix-custom-V2
           - group: passwords
-            scenarios: legacy empty null omitted custom custom-spaces
+            scenarios: empty null omitted rotation-empty rotation-null rotation-omitted custom-spaces
           - group: historical-default
             scenarios: newline stored-newline rotation-newline rotation-stored-newline
           - group: pending
@@ -21,15 +23,15 @@ jobs:
           - group: failures
             scenarios: missing-readonly rotation-missing-readonly rotation-missing-store split-store unknown invalid-json
           - group: channels-and-rotation
-            scenarios: password-only rotation rotation-custom rotation-custom-spaces
+            scenarios: password-only rotation rotation-custom-spaces
           - group: copilot-regressions
             scenarios: fresh-rotation custom-dir
     steps:
       - uses: actions/checkout@v5
       - name: Record sources and check shell syntax
         run: |
-          git hash-object docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh
-          for script in docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh; do bash -n "$script"; done
+          git hash-object docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh docker-macaroon-password-rotation-tests.sh
+          for script in docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh docker-macaroon-password-rotation-tests.sh; do bash -n "$script"; done
       - name: Released LND integration
         env:
           TEST_SCENARIOS: ${{ matrix.scenarios }}
