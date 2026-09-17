@@ -13,7 +13,7 @@ jobs:
       matrix:
         include:
           - group: rotation-matrix
-            scenarios: matrix-legacy-none matrix-legacy-V1 matrix-legacy-V2 matrix-default-none matrix-default-V1 matrix-default-V2 matrix-custom-none matrix-custom-V1 matrix-custom-V2
+            scenarios: matrix-legacy-none matrix-legacy-V1 matrix-legacy-V2 matrix-default-none matrix-default-V1 matrix-default-V2 matrix-custom-none matrix-custom-V1 matrix-custom-V2 legacy-no-rotation
           - group: passwords
             scenarios: empty null omitted rotation-empty rotation-null rotation-omitted custom-spaces
           - group: historical-default
