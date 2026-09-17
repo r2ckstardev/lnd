@@ -30,9 +30,9 @@ jobs:
       - uses: actions/checkout@v5
       - name: Record sources and check shell syntax
         run: |
-          git hash-object docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh docker-macaroon-password-rotation-tests.sh
-          for script in docker-entrypoint.sh docker-initunlocklnd.sh docker-startup-tests.sh docker-macaroon-password-rotation-tests.sh; do bash -n "$script"; done
+          git hash-object docker-entrypoint.sh docker-initunlocklnd.sh btcpay/test-startup-tests.sh .github/workflows/btcpay-tests.yml
+          for script in docker-entrypoint.sh docker-initunlocklnd.sh btcpay/test-startup-tests.sh; do bash -n "$script"; done
       - name: Released LND integration
         env:
           TEST_SCENARIOS: ${{ matrix.scenarios }}
-        run: bash docker-startup-tests.sh
+        run: bash btcpay/test-startup-tests.sh
